@@ -148,7 +148,7 @@ namespace PgsToSrt.BluRaySup
 
         private static void PutPixel(Span<Rgba32> bmp, int index, Rgba32 color)
         {
-            if (color.A > 0)
+            if (index >= 0 && index < bmp.Length && color.A > 0)
             {
                 bmp[index] = color;
             }
