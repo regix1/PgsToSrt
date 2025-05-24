@@ -1,7 +1,9 @@
 # .github/workflows/release.yml
-# Builds .NET binaries when you create version tags
+# Builds .NET binaries when you create a release in GitHub UI
 name: release
 on:
+  release:
+    types: [published]
   push:
     tags:
       - 'v*'
@@ -30,10 +32,9 @@ jobs:
           cd release
           zip -r ../PgsToSrt-${{ github.ref_name }}.zip .
       
-      - name: Create GitHub Release
+      - name: Upload Release Asset
         uses: softprops/action-gh-release@v1
         with:
           files: PgsToSrt-${{ github.ref_name }}.zip
-          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
