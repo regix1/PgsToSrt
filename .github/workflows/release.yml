@@ -1,5 +1,5 @@
 # .github/workflows/release.yml
-# Builds .NET binaries when you create a release in GitHub UI
+# Builds .NET binaries for multiple platforms
 name: release
 on:
   release:
@@ -10,6 +10,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        runtime: [win-x64, linux-x64, osx-x64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,18 +26,24 @@ jobs:
         run: |
           dotnet publish src/PgsToSrt \
             --configuration Release \
-            --runtime linux-x64 \
-            --self-contained false \
-            --output ./release
+            --runtime ${{ matrix.runtime }} \
+            --self-contained true \
+            --output ./release-${{ matrix.runtime }} \
+            -p:PublishSingleFile=false \
+            -p:PublishReadyToRun=false
       
       - name: Create Release Archive
         run: |
-          cd release
-          zip -r ../PgsToSrt-${{ github.ref_name }}.zip .
+          cd release-${{ matrix.runtime }}
+          if [[ "${{ matrix.runtime }}" == win-* ]]; then
+            zip -r ../PgsToSrt-${{ github.ref_name }}-${{ matrix.runtime }}.zip .
+          else
+            tar -czf ../PgsToSrt-${{ github.ref_name }}-${{ matrix.runtime }}.tar.gz .
+          fi
       
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v1
         with:
-          files: PgsToSrt-${{ github.ref_name }}.zip
+          files: PgsToSrt-${{ github.ref_name }}-${{ matrix.runtime }}.*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
