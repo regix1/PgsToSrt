@@ -27,7 +27,7 @@ public class PgsOcr
 
     public string TesseractDataPath { get; set; }
     public string TesseractLanguage { get; set; } = "eng";
-    public string SpecialCharactersToIgnore { get; set; }
+    public string CharacterBlacklist { get; set; }
 
     public PgsOcr(Microsoft.Extensions.Logging.ILogger logger, string tesseractVersion, string libLeptName, string libLeptVersion)
     {
@@ -68,9 +68,9 @@ public class PgsOcr
         _logger.LogInformation($"Starting OCR for {_bluraySubtitles.Count} items...");
         _logger.LogInformation($"Tesseract version {_tesseractVersion}");
 
-        if (!string.IsNullOrEmpty(SpecialCharactersToIgnore))
+        if (!string.IsNullOrEmpty(CharacterBlacklist))
         {
-            _logger.LogInformation($"Special characters to ignore: {SpecialCharactersToIgnore}");
+            _logger.LogInformation($"Character blacklist: {CharacterBlacklist}");
         }
 
         var exception = TesseractApi.Initialize(_tesseractVersion, _libLeptName, _libLeptVersion);
@@ -123,20 +123,15 @@ public class PgsOcr
     {
         using var bitmap = GetSubtitleBitmap(index);
         using var image = GetPix(bitmap);
-        using var page = engine.Process(image, PageSegMode.Auto);
-
-        var text = page.Text?.Trim();
         
-        // Remove special characters if specified
-        if (!string.IsNullOrEmpty(SpecialCharactersToIgnore) && !string.IsNullOrEmpty(text))
+        // Set character blacklist if specified
+        if (!string.IsNullOrEmpty(CharacterBlacklist))
         {
-            foreach (char specialChar in SpecialCharactersToIgnore)
-            {
-                text = text.Replace(specialChar.ToString(), "");
-            }
+            engine.SetVariable("tessedit_char_blacklist", CharacterBlacklist);
         }
-
-        return text;
+        
+        using var page = engine.Process(image, PageSegMode.Auto);
+        return page.Text?.Trim();
     }
 
     private static TesseractOCR.Pix.Image GetPix(Image<Rgba32> bitmap)

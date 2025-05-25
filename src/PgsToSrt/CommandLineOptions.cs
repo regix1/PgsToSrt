@@ -31,7 +31,7 @@ namespace PgsToSrt
         [Option(Required = false, HelpText = "Leptonica library version.", Default = "5")]
         public string LibLeptVersion { get; set; }
 
-        [Option('s', "special", Required = false, HelpText = "Special characters to ignore during OCR processing (e.g., |/`_~<>)")]
-        public string SpecialCharacters { get; set; }
+        [Option('b', "blacklist", Required = false, HelpText = "Character blacklist to improve OCR (e.g., \"|\\/`_~<>\")")]
+        public string CharacterBlacklist { get; set; }
     }
 }
