@@ -27,6 +27,7 @@ public class PgsOcr
 
     public string TesseractDataPath { get; set; }
     public string TesseractLanguage { get; set; } = "eng";
+    public string SpecialCharactersToIgnore { get; set; }
 
     public PgsOcr(Microsoft.Extensions.Logging.ILogger logger, string tesseractVersion, string libLeptName, string libLeptVersion)
     {
@@ -66,6 +67,11 @@ public class PgsOcr
     {
         _logger.LogInformation($"Starting OCR for {_bluraySubtitles.Count} items...");
         _logger.LogInformation($"Tesseract version {_tesseractVersion}");
+
+        if (!string.IsNullOrEmpty(SpecialCharactersToIgnore))
+        {
+            _logger.LogInformation($"Special characters to ignore: {SpecialCharactersToIgnore}");
+        }
 
         var exception = TesseractApi.Initialize(_tesseractVersion, _libLeptName, _libLeptVersion);
         if (exception != null)
@@ -119,7 +125,18 @@ public class PgsOcr
         using var image = GetPix(bitmap);
         using var page = engine.Process(image, PageSegMode.Auto);
 
-        return page.Text?.Trim();
+        var text = page.Text?.Trim();
+        
+        // Remove special characters if specified
+        if (!string.IsNullOrEmpty(SpecialCharactersToIgnore) && !string.IsNullOrEmpty(text))
+        {
+            foreach (char specialChar in SpecialCharactersToIgnore)
+            {
+                text = text.Replace(specialChar.ToString(), "");
+            }
+        }
+
+        return text;
     }
 
     private static TesseractOCR.Pix.Image GetPix(Image<Rgba32> bitmap)
