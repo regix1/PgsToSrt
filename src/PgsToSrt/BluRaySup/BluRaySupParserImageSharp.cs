@@ -79,6 +79,7 @@ public static class BluRaySupParserImageSharp
             if (buffer[index] == 128)
                 return true;
             num = BigEndianInt16(buffer, index + 1) + 3;
+            if (num <= 0) break; // Prevent infinite loop
         }
 
         return false;
@@ -87,7 +88,7 @@ public static class BluRaySupParserImageSharp
     private static SupSegment ParseSegmentHeader(byte[] buffer, StringBuilder log)
     {
         var segmentHeader = new SupSegment();
-        if (buffer[0] == 80 && buffer[1] == 71)
+        if (buffer.Length >= 13 && buffer[0] == 80 && buffer[1] == 71)
         {
             segmentHeader.PtsTimestamp = BigEndianInt32(buffer, 2);
             segmentHeader.Type = buffer[10];
@@ -99,6 +100,9 @@ public static class BluRaySupParserImageSharp
 
     private static SupSegment ParseSegmentHeaderFromMatroska(byte[] buffer)
     {
+        if (buffer.Length < 3)
+            return new SupSegment();
+            
         return new SupSegment()
         {
             Type = buffer[0],
@@ -108,6 +112,10 @@ public static class BluRaySupParserImageSharp
 
     private static PcsObject ParsePcs(byte[] buffer, int offset)
     {
+        // Add bounds checking
+        if (buffer.Length < 19 + offset)
+            return null;
+            
         return new PcsObject()
         {
             ObjectId = BigEndianInt16(buffer, 11 + offset),
@@ -150,9 +158,12 @@ public static class BluRaySupParserImageSharp
             for (var index = 0; index < num; ++index)
             {
                 var pcs = ParsePcs(buffer, offset);
-                picture.PcsObjects.Add(pcs);
-                stringBuilder.AppendLine();
-                stringBuilder.Append($"ObjId: {pcs.ObjectId}, WinId: {pcs.WindowId}, Forced: {pcs.IsForced}, X: {pcs.Origin.X}, Y: {pcs.Origin.Y}");
+                if (pcs != null) // Check for null from bounds checking
+                {
+                    picture.PcsObjects.Add(pcs);
+                    stringBuilder.AppendLine();
+                    stringBuilder.Append($"ObjId: {pcs.ObjectId}, WinId: {pcs.WindowId}, Forced: {pcs.IsForced}, X: {pcs.Origin.X}, Y: {pcs.Origin.Y}");
+                }
                 offset += 8;
             }
         }
@@ -192,16 +203,19 @@ public static class BluRaySupParserImageSharp
         byte[] buffer,
         SupSegment segment)
     {
+        if (buffer.Length < 2)
+            return new PdsData() { Message = "Buffer too short" };
+            
         int num1 = buffer[0];
         int num2 = buffer[1];
         PaletteInfo paletteInfo = new PaletteInfo()
         {
             PaletteSize = (segment.Size - 2) / 5
         };
-        if (paletteInfo.PaletteSize <= 0)
+        if (paletteInfo.PaletteSize <= 0 || buffer.Length < 2 + paletteInfo.PaletteSize * 5)
             return new PdsData()
             {
-                Message = "Empty palette"
+                Message = "Empty palette or buffer too short"
             };
         paletteInfo.PaletteBuffer = new byte[paletteInfo.PaletteSize * 5];
         Buffer.BlockCopy(buffer, 2, paletteInfo.PaletteBuffer, 0, paletteInfo.PaletteSize * 5);
@@ -219,6 +233,9 @@ public static class BluRaySupParserImageSharp
         SupSegment segment,
         bool forceFirst)
     {
+        if (buffer.Length < 4)
+            return null;
+            
         var num1 = BigEndianInt16(buffer, 0);
         var num2 = buffer[2];
         var num3 = buffer[3];
@@ -227,9 +244,16 @@ public static class BluRaySupParserImageSharp
         var imageObjectFragment = new ImageObjectFragment();
         if (flag1)
         {
+            if (buffer.Length < 11)
+                return null;
+                
             var width = BigEndianInt16(buffer, 7);
             var height = BigEndianInt16(buffer, 9);
             imageObjectFragment.ImagePacketSize = segment.Size - 11;
+            
+            if (imageObjectFragment.ImagePacketSize < 0 || buffer.Length < 11 + imageObjectFragment.ImagePacketSize)
+                return null;
+                
             imageObjectFragment.ImageBuffer = new byte[imageObjectFragment.ImagePacketSize];
             Buffer.BlockCopy(buffer, 11, imageObjectFragment.ImageBuffer, 0, imageObjectFragment.ImagePacketSize);
             return new OdsData()
@@ -244,6 +268,9 @@ public static class BluRaySupParserImageSharp
         }
 
         imageObjectFragment.ImagePacketSize = segment.Size - 4;
+        if (imageObjectFragment.ImagePacketSize < 0 || buffer.Length < 4 + imageObjectFragment.ImagePacketSize)
+            return null;
+            
         imageObjectFragment.ImageBuffer = new byte[imageObjectFragment.ImagePacketSize];
         Buffer.BlockCopy(buffer, 4, imageObjectFragment.ImageBuffer, 0, imageObjectFragment.ImagePacketSize);
         return new OdsData()
@@ -278,6 +305,13 @@ public static class BluRaySupParserImageSharp
             var num3 = num1 + buffer1.Length;
             try
             {
+                // Add bounds checking for segment size
+                if (segment.Size < 0 || segment.Size > 1024 * 1024) // 1MB limit
+                {
+                    log.AppendLine($"Invalid segment size: {segment.Size}");
+                    break;
+                }
+                
                 byte[] buffer2 = new byte[segment.Size];
                 if (ms.Read(buffer2, 0, buffer2.Length) >= buffer2.Length)
                 {
@@ -287,7 +321,7 @@ public static class BluRaySupParserImageSharp
                             if (pcs1 != null)
                             {
                                 PdsData pds = ParsePds(buffer2, segment);
-                                if (pds.PaletteInfo != null)
+                                if (pds?.PaletteInfo != null)
                                 {
                                     if (!dictionary.ContainsKey(pds.PaletteId))
                                         dictionary[pds.PaletteId] = new List<PaletteInfo>();
@@ -305,19 +339,22 @@ public static class BluRaySupParserImageSharp
                             if (pcs1 != null)
                             {
                                 OdsData ods = ParseOds(buffer2, segment, forceFirst);
-                                List<OdsData> odsDataList;
-                                if (!pcs1.PaletteUpdate)
+                                if (ods != null) // Check for null from bounds checking
                                 {
-                                    if (ods.IsFirst)
+                                    List<OdsData> odsDataList;
+                                    if (!pcs1.PaletteUpdate)
                                     {
-                                        odsDataList = new List<OdsData>()
+                                        if (ods.IsFirst)
                                         {
-                                            ods
-                                        };
-                                        bitmapObjects[ods.ObjectId] = odsDataList;
+                                            odsDataList = new List<OdsData>()
+                                            {
+                                                ods
+                                            };
+                                            bitmapObjects[ods.ObjectId] = odsDataList;
+                                        }
+                                        else if (bitmapObjects.TryGetValue(ods.ObjectId, out odsDataList))
+                                            odsDataList.Add(ods);
                                     }
-                                    else if (bitmapObjects.TryGetValue(ods.ObjectId, out odsDataList))
-                                        odsDataList.Add(ods);
                                 }
 
                                 forceFirst = false;
@@ -342,11 +379,11 @@ public static class BluRaySupParserImageSharp
 
                             break;
                         case 23:
-                            if (pcs1 != null)
+                            if (pcs1 != null && buffer2.Length > 0)
                             {
                                 int num4 = buffer2[0];
                                 int num5 = 0;
-                                for (int index = 0; index < num4; ++index)
+                                for (int index = 0; index < num4 && num5 + 8 < buffer2.Length; ++index)
                                 {
                                     int num6 = buffer2[1 + num5];
                                     int num7 = BigEndianInt16(buffer2, 2 + num5);
@@ -377,9 +414,10 @@ public static class BluRaySupParserImageSharp
                 else
                     break;
             }
-            catch (IndexOutOfRangeException ex)
+            catch (Exception ex)
             {
-                log.Append($"Index of of range at pos {num3 - buffer1.Length}: {ex.StackTrace}");
+                log.Append($"Error at pos {num3 - buffer1.Length}: {ex.Message}");
+                break; // Exit on serious errors
             }
 
             num1 = num3 + segment.Size;
@@ -546,15 +584,22 @@ public static class BluRaySupParserImageSharp
         if (num1 < 400.0 || num2 < 400.0 || pcs1.PaletteInfos.Count > 2 || pcs2.PaletteInfos.Count > 2)
             return true;
 
-        using var bitmap1 = pcs1.GetRgba32();
-        using var bitmap2 = pcs2.GetRgba32();
+        try
+        {
+            using var bitmap1 = pcs1.GetRgba32();
+            using var bitmap2 = pcs2.GetRgba32();
 
-        var transparentHeight = bitmap1.GetNonTransparentHeight();
-        var transparentWidth = bitmap1.GetNonTransparentWidth();
-        if (transparentHeight > 110 || transparentWidth > 300)
-            return true;
+            var transparentHeight = bitmap1.GetNonTransparentHeight();
+            var transparentWidth = bitmap1.GetNonTransparentWidth();
+            if (transparentHeight > 110 || transparentWidth > 300)
+                return true;
 
-        return bitmap1.IsEqualTo(bitmap2);
+            return bitmap1.IsEqualTo(bitmap2);
+        }
+        catch
+        {
+            return true; // If image processing fails, merge anyway
+        }
     }
 
     private static bool ByteArraysEqual(byte[] b1, byte[] b2)
@@ -591,43 +636,23 @@ public static class BluRaySupParserImageSharp
 
     private static int BigEndianInt16(byte[] buffer, int index)
     {
-        return buffer.Length < 2 ? 0 : buffer[index + 1] | buffer[index] << 8;
+        return buffer.Length < index + 2 ? 0 : buffer[index + 1] | buffer[index] << 8;
     }
 
     private static uint BigEndianInt32(byte[] buffer, int index)
     {
-        return buffer.Length < 4 ? 0U : (uint) (buffer[index + 3] + (buffer[index + 2] << 8) + (buffer[index + 1] << 16) + (buffer[index] << 24));
-    }
-
-    private class SupSegment
-    {
-        public int Type { get; set; }
-
-        public int Size { get; set; }
-
-        public long PtsTimestamp { get; set; }
-    }
-
-    public class PcsObject
-    {
-        public int ObjectId { get; init; }
-
-        public int WindowId { get; init; }
-
-        public bool IsForced { get; init; }
-
-        public Point Origin { get; init; }
+        return buffer.Length < index + 4 ? 0U : (uint) (buffer[index + 3] + (buffer[index + 2] << 8) + (buffer[index + 1] << 16) + (buffer[index] << 24));
     }
 
     public static BluRaySupPalette DecodePalette(IList<PaletteInfo> paletteInfos)
     {
         var bluRaySupPalette = new BluRaySupPalette(256);
-        if (paletteInfos.Count == 0)
+        if (paletteInfos == null || paletteInfos.Count == 0)
             return bluRaySupPalette;
         var paletteInfo = paletteInfos[paletteInfos.Count - 1];
         var flag = false;
         var index1 = 0;
-        for (var index2 = 0; index2 < paletteInfo.PaletteSize; ++index2)
+        for (var index2 = 0; index2 < paletteInfo.PaletteSize && index1 + 4 < paletteInfo.PaletteBuffer.Length; ++index2)
         {
             var index3 = paletteInfo.PaletteBuffer[index1];
             int num1;
@@ -661,6 +686,26 @@ public static class BluRaySupParserImageSharp
         return bluRaySupPalette;
     }
 
+    private class SupSegment
+    {
+        public int Type { get; set; }
+
+        public int Size { get; set; }
+
+        public long PtsTimestamp { get; set; }
+    }
+
+    public class PcsObject
+    {
+        public int ObjectId { get; init; }
+
+        public int WindowId { get; init; }
+
+        public bool IsForced { get; init; }
+
+        public Point Origin { get; init; }
+    }
+
     public class PcsData
     {
         public int CompNum { get; init; }
@@ -689,12 +734,12 @@ public static class BluRaySupParserImageSharp
 
         public bool IsForced
         {
-            get { return PcsObjects.Any((Func<PcsObject, bool>) (obj => obj.IsForced)); }
+            get { return PcsObjects?.Any((Func<PcsObject, bool>) (obj => obj.IsForced)) ?? false; }
         }
 
         public Position GetPosition()
         {
-            return PcsObjects.Count > 0 ? new Position(PcsObjects.Min((Func<PcsObject, int>) (p => p.Origin.X)), this.PcsObjects.Min<PcsObject>((Func<PcsObject, int>) (p => p.Origin.Y))) : new Position(0, 0);
+            return PcsObjects?.Count > 0 ? new Position(PcsObjects.Min((Func<PcsObject, int>) (p => p.Origin.X)), this.PcsObjects.Min<PcsObject>((Func<PcsObject, int>) (p => p.Origin.Y))) : new Position(0, 0);
         }
 
         public TimeCode StartTimeCode => new TimeCode(StartTime / 90.0);
