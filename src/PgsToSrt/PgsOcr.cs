@@ -82,7 +82,6 @@ public class PgsOcr
         }
 
         var ocrResults = new ConcurrentBag<Paragraph>();
-        var lockObject = new object();
 
         // Process subtitles in parallel
         Parallel.ForEach(Enumerable.Range(0, _bluraySubtitles.Count), i =>
@@ -90,12 +89,6 @@ public class PgsOcr
             try
             {
                 var item = _bluraySubtitles[i];
-                
-                // Skip items with invalid timing
-                if (item.StartTime >= item.EndTime)
-                {
-                    return;
-                }
 
                 var paragraph = new Paragraph
                 {
@@ -109,31 +102,24 @@ public class PgsOcr
 
                 if (i % 50 == 0)
                 {
-                    lock (lockObject)
-                    {
-                        _logger.LogInformation($"Processed item {paragraph.Number}.");
-                    }
+                    _logger.LogInformation($"Processed item {paragraph.Number}.");
                 }
             }
             catch (Exception ex)
             {
-                lock (lockObject)
-                {
-                    _logger.LogError(ex, $"Error processing item {i}: {ex.Message}");
-                }
+                _logger.LogError(ex, $"Error processing item {i}: {ex.Message}");
             }
         });
 
-        // Sort the results and filter out empty/invalid entries
+        // Sort the results and filter out empty entries
         var validResults = ocrResults
             .OrderBy(p => p.Number)
-            .Where(p => !string.IsNullOrWhiteSpace(p.Text) && 
-                       p.EndTime.TotalMilliseconds - p.StartTime.TotalMilliseconds > 100) // Minimum 100ms duration
+            .Where(p => !string.IsNullOrWhiteSpace(p.Text))
             .ToList();
 
         _subtitle.Paragraphs.AddRange(validResults);
 
-        _logger.LogInformation($"Finished OCR. Processed {ocrResults.Count} items, kept {validResults.Count} valid entries.");
+        _logger.LogInformation($"Finished OCR. Kept {validResults.Count} valid entries out of {ocrResults.Count} processed.");
         return true;
     }
 
@@ -147,14 +133,11 @@ public class PgsOcr
                 return string.Empty;
             }
 
-            // Try two different OCR approaches
-            var result1 = TryOcrMethod1(bitmap, index);
-            var result2 = TryOcrMethod2(bitmap, index);
+            // Try two different approaches and pick the better result
+            var result1 = TryOcrMethod1(bitmap);
+            var result2 = TryOcrMethod2(bitmap);
 
-            // Pick the better result
-            var bestResult = ChooseBestResult(result1, result2);
-            
-            return string.IsNullOrEmpty(bestResult) ? string.Empty : bestResult;
+            return ChooseBestResult(result1, result2);
         }
         catch (Exception ex)
         {
@@ -163,96 +146,62 @@ public class PgsOcr
         }
     }
 
-    private string TryOcrMethod1(Image<Rgba32> bitmap, int index)
+    private string TryOcrMethod1(Image<Rgba32> bitmap)
     {
         try
         {
-            // Method 1: Preprocessed image with strict settings
-            using var processedBitmap = PreprocessImageMethod1(bitmap);
-            using var image = GetPix(processedBitmap);
-            if (image == null) return string.Empty;
-
+            // Method 1: Original approach with some improvements
             using var engine = new Engine(TesseractDataPath, TesseractLanguage);
             
-            // Strict OCR settings
+            if (!string.IsNullOrEmpty(CharacterBlacklist))
+                engine.SetVariable("tessedit_char_blacklist", CharacterBlacklist);
+            
+            using var image = GetPix(bitmap);
+            using var page = engine.Process(image, PageSegMode.Auto);
+            
+            return page.Text?.Trim() ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private string TryOcrMethod2(Image<Rgba32> bitmap)
+    {
+        try
+        {
+            // Method 2: Enhanced preprocessing + different settings
+            using var processedBitmap = PreprocessImage(bitmap);
+            using var engine = new Engine(TesseractDataPath, TesseractLanguage);
+            
+            // More restrictive settings for cleaner text
             engine.SetVariable("tessedit_char_whitelist", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,!?'-:;()[]{}\"");
             engine.SetVariable("tessedit_pageseg_mode", "6"); // Single uniform block
-            engine.SetVariable("tessedit_ocr_engine_mode", "1"); // LSTM only
             
             if (!string.IsNullOrEmpty(CharacterBlacklist))
                 engine.SetVariable("tessedit_char_blacklist", CharacterBlacklist);
             
-            using var page = engine.Process(image, PageSegMode.SingleBlock);
-            return page.Text?.Trim() ?? string.Empty;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug($"OCR Method 1 failed for index {index}: {ex.Message}");
-            return string.Empty;
-        }
-    }
-
-    private string TryOcrMethod2(Image<Rgba32> bitmap, int index)
-    {
-        try
-        {
-            // Method 2: Different preprocessing with more flexible settings
-            using var processedBitmap = PreprocessImageMethod2(bitmap);
             using var image = GetPix(processedBitmap);
-            if (image == null) return string.Empty;
-
-            using var engine = new Engine(TesseractDataPath, TesseractLanguage);
+            using var page = engine.Process(image, PageSegMode.SingleBlock);
             
-            // More flexible OCR settings
-            engine.SetVariable("tessedit_pageseg_mode", "8"); // Single word
-            engine.SetVariable("tessedit_ocr_engine_mode", "3"); // Default + LSTM
-            
-            if (!string.IsNullOrEmpty(CharacterBlacklist))
-                engine.SetVariable("tessedit_char_blacklist", CharacterBlacklist);
-            
-            using var page = engine.Process(image, PageSegMode.SingleWord);
             return page.Text?.Trim() ?? string.Empty;
         }
-        catch (Exception ex)
+        catch
         {
-            _logger.LogDebug($"OCR Method 2 failed for index {index}: {ex.Message}");
             return string.Empty;
         }
     }
 
-    private static Image<Rgba32> PreprocessImageMethod1(Image<Rgba32> original)
+    private static Image<Rgba32> PreprocessImage(Image<Rgba32> original)
     {
         var processed = original.Clone();
         
         processed.Mutate(x => x
-            // Convert to grayscale for better OCR
-            .Grayscale()
-            // High contrast for clear text
-            .Contrast(1.8f)
-            // Sharpen for crisp edges
-            .GaussianSharpen(0.8f)
-            // Scale up significantly
-            .Resize(original.Width * 3, original.Height * 3)
-        );
-        
-        return processed;
-    }
-
-    private static Image<Rgba32> PreprocessImageMethod2(Image<Rgba32> original)
-    {
-        var processed = original.Clone();
-        
-        processed.Mutate(x => x
-            // Keep color information initially
-            .Contrast(1.3f)
-            // Light blur to reduce noise
-            .GaussianBlur(0.5f)
-            // Then convert to grayscale
-            .Grayscale()
-            // Moderate scaling
-            .Resize(original.Width * 2, original.Height * 2)
-            // Final sharpening
-            .GaussianSharpen(0.3f)
+            .Grayscale()           // Convert to grayscale
+            .Contrast(1.5f)        // Increase contrast
+            .GaussianSharpen(0.5f) // Sharpen slightly
+            .Resize(original.Width * 2, original.Height * 2) // Scale up 2x
         );
         
         return processed;
@@ -265,96 +214,46 @@ public class PgsOcr
         if (string.IsNullOrWhiteSpace(result2)) return result1;
 
         // Prefer longer results (usually more complete)
-        if (result2.Length > result1.Length * 1.2) return result2;
-        if (result1.Length > result2.Length * 1.2) return result1;
+        if (result2.Length > result1.Length * 1.3) return result2;
+        if (result1.Length > result2.Length * 1.3) return result1;
 
-        // Prefer results with fewer OCR artifacts
-        int artifacts1 = CountOcrArtifacts(result1);
-        int artifacts2 = CountOcrArtifacts(result2);
+        // Prefer results with fewer artifacts
+        int artifacts1 = CountArtifacts(result1);
+        int artifacts2 = CountArtifacts(result2);
         
         if (artifacts1 < artifacts2) return result1;
         if (artifacts2 < artifacts1) return result2;
-
-        // Prefer results with more dictionary words (simple heuristic)
-        int words1 = CountLikelyWords(result1);
-        int words2 = CountLikelyWords(result2);
-        
-        if (words1 > words2) return result1;
-        if (words2 > words1) return result2;
 
         // Default to first result
         return result1;
     }
 
-    private static int CountOcrArtifacts(string text)
+    private static int CountArtifacts(string text)
     {
         if (string.IsNullOrEmpty(text)) return 0;
         
         int count = 0;
-        var artifacts = new[] { '|', '~', '^', '*', '#', '%', '&', '@', '}', '{', ']', '[' };
-        
         foreach (char c in text)
         {
-            foreach (var artifact in artifacts)
+            if (c == '|' || c == '~' || c == '^' || c == '*' || c == '#' || 
+                c == '%' || c == '&' || c == '@' || c == '}' || c == '{' || 
+                c == ']' || c == '[')
             {
-                if (c == artifact)
-                {
-                    count++;
-                    break;
-                }
+                count++;
             }
         }
-        
         return count;
-    }
-
-    private static int CountLikelyWords(string text)
-    {
-        if (string.IsNullOrEmpty(text)) return 0;
-        
-        var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        int wordCount = 0;
-        
-        foreach (var word in words)
-        {
-            // Simple heuristic: words with more vowels are more likely to be real
-            var cleanWord = word.ToLower().Trim(".,!?;:()[]{}\"'-".ToCharArray());
-            if (cleanWord.Length >= 2)
-            {
-                int vowelCount = 0;
-                foreach (char c in cleanWord)
-                {
-                    if ("aeiou".Contains(c))
-                        vowelCount++;
-                }
-                
-                if (vowelCount > 0 && vowelCount <= cleanWord.Length * 0.7) // Reasonable vowel ratio
-                {
-                    wordCount++;
-                }
-            }
-        }
-        
-        return wordCount;
     }
 
     private static TesseractOCR.Pix.Image GetPix(Image<Rgba32> bitmap)
     {
-        try
+        byte[] bytes;
+        using (var stream = new MemoryStream())
         {
-            byte[] bytes;
-            using (var stream = new MemoryStream())
-            {
-                // Use PNG format to preserve quality better than BMP
-                bitmap.SaveAsPng(stream);
-                bytes = stream.ToArray();
-            }
-            return TesseractOCR.Pix.Image.LoadFromMemory(bytes);
+            bitmap.SaveAsBmp(stream);
+            bytes = stream.ToArray();
         }
-        catch (Exception ex)
-        {
-            throw new InvalidOperationException($"Failed to convert image to Pix format: {ex.Message}", ex);
-        }
+        return TesseractOCR.Pix.Image.LoadFromMemory(bytes);
     }
 
     private Image<Rgba32> GetSubtitleBitmap(int index)
@@ -362,17 +261,9 @@ public class PgsOcr
         try
         {
             if (index < 0 || index >= _bluraySubtitles.Count)
-            {
                 return null;
-            }
 
-            var item = _bluraySubtitles[index];
-            if (item?.PcsObjects == null || item.PcsObjects.Count == 0)
-            {
-                return null;
-            }
-
-            return item.GetRgba32();
+            return _bluraySubtitles[index].GetRgba32();
         }
         catch (Exception ex)
         {
