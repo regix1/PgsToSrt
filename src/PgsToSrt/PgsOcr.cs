@@ -119,9 +119,13 @@ public class PgsOcr
 
         // Sort the results by number and add them to the subtitle
         var sortedResults = ocrResults.OrderBy(p => p.Number).ToList();
-        _subtitle.Paragraphs.AddRange(sortedResults);
+        
+        // Merge subtitles that are too close together or overlapping
+        var mergedResults = MergeCloseSubtitles(sortedResults);
+        
+        _subtitle.Paragraphs.AddRange(mergedResults);
 
-        _logger.LogInformation($"Finished OCR. Found {sortedResults.Count} valid subtitles out of {_bluraySubtitles.Count} processed.");
+        _logger.LogInformation($"Finished OCR. Found {mergedResults.Count} valid subtitles out of {_bluraySubtitles.Count} processed (merged from {sortedResults.Count}).");
         return true;
     }
 
@@ -235,6 +239,119 @@ public class PgsOcr
         score -= specialChars * 3; // 3 point penalty per bad special char
         
         return Math.Max(0, score);
+    }
+
+    private List<Paragraph> MergeCloseSubtitles(List<Paragraph> paragraphs)
+    {
+        if (paragraphs.Count <= 1) return paragraphs;
+
+        var merged = new List<Paragraph>();
+        var current = paragraphs[0];
+
+        for (int i = 1; i < paragraphs.Count; i++)
+        {
+            var next = paragraphs[i];
+            
+            // Check if subtitles should be merged
+            if (ShouldMerge(current, next))
+            {
+                // Merge the current and next subtitle
+                current = MergeSubtitles(current, next);
+            }
+            else
+            {
+                // Add current to results and move to next
+                merged.Add(current);
+                current = next;
+            }
+        }
+        
+        // Add the last subtitle
+        merged.Add(current);
+
+        // Renumber the merged subtitles
+        for (int i = 0; i < merged.Count; i++)
+        {
+            merged[i].Number = i + 1;
+        }
+
+        return merged;
+    }
+
+    private static bool ShouldMerge(Paragraph current, Paragraph next)
+    {
+        // Calculate time gap between subtitles
+        var gap = next.StartTime.TotalMilliseconds - current.EndTime.TotalMilliseconds;
+        
+        // Merge if overlapping or very close (within 500ms)
+        if (gap <= 500)
+        {
+            return true;
+        }
+        
+        // Check for text similarity that suggests they're the same subtitle split
+        if (gap <= 2000) // Within 2 seconds
+        {
+            var currentText = current.Text.ToLower().Trim();
+            var nextText = next.Text.ToLower().Trim();
+            
+            // If one text contains the other, or they start similarly, merge them
+            if (currentText.Contains(nextText) || nextText.Contains(currentText) ||
+                (currentText.Length > 10 && nextText.Length > 10 && 
+                 currentText.Substring(0, Math.Min(10, currentText.Length)) == 
+                 nextText.Substring(0, Math.Min(10, nextText.Length))))
+            {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    private static Paragraph MergeSubtitles(Paragraph first, Paragraph second)
+    {
+        // Choose the better text (longer and higher quality)
+        var firstScore = ScoreTextQuality(first.Text);
+        var secondScore = ScoreTextQuality(second.Text);
+        
+        string mergedText;
+        if (firstScore > secondScore * 1.2) // First is significantly better
+        {
+            mergedText = first.Text;
+        }
+        else if (secondScore > firstScore * 1.2) // Second is significantly better
+        {
+            mergedText = second.Text;
+        }
+        else
+        {
+            // Similar quality, combine them intelligently
+            var firstText = first.Text.Trim();
+            var secondText = second.Text.Trim();
+            
+            // If one contains the other, use the longer one
+            if (firstText.Contains(secondText))
+            {
+                mergedText = firstText;
+            }
+            else if (secondText.Contains(firstText))
+            {
+                mergedText = secondText;
+            }
+            else
+            {
+                // Combine them with a line break
+                mergedText = firstText + "\n" + secondText;
+            }
+        }
+
+        return new Paragraph
+        {
+            Number = first.Number,
+            StartTime = new TimeCode(Math.Min(first.StartTime.TotalMilliseconds, second.StartTime.TotalMilliseconds)),
+            EndTime = new TimeCode(Math.Max(first.EndTime.TotalMilliseconds, second.EndTime.TotalMilliseconds)),
+            Text = mergedText
+        };
     }
 
     private static Image<Rgba32> PreprocessImageForOcr(Image<Rgba32> original)
