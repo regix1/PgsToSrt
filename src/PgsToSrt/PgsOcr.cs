@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -90,19 +89,25 @@ public class PgsOcr
             {
                 var item = _bluraySubtitles[i];
 
-                var paragraph = new Paragraph
+                var text = GetText(i);
+                
+                // Only add non-empty results
+                if (!string.IsNullOrWhiteSpace(text))
                 {
-                    Number = i + 1,
-                    StartTime = new TimeCode(item.StartTime / 90.0),
-                    EndTime = new TimeCode(item.EndTime / 90.0),
-                    Text = GetText(i)
-                };
+                    var paragraph = new Paragraph
+                    {
+                        Number = i + 1,
+                        StartTime = new TimeCode(item.StartTime / 90.0),
+                        EndTime = new TimeCode(item.EndTime / 90.0),
+                        Text = text
+                    };
 
-                ocrResults.Add(paragraph);
+                    ocrResults.Add(paragraph);
+                }
 
                 if (i % 50 == 0)
                 {
-                    _logger.LogInformation($"Processed item {paragraph.Number}.");
+                    _logger.LogInformation($"Processed item {i + 1}.");
                 }
             }
             catch (Exception ex)
@@ -111,15 +116,11 @@ public class PgsOcr
             }
         });
 
-        // Sort the results and filter out empty entries
-        var validResults = ocrResults
-            .OrderBy(p => p.Number)
-            .Where(p => !string.IsNullOrWhiteSpace(p.Text))
-            .ToList();
+        // Sort the results by number and add them to the subtitle
+        var sortedResults = ocrResults.OrderBy(p => p.Number).ToList();
+        _subtitle.Paragraphs.AddRange(sortedResults);
 
-        _subtitle.Paragraphs.AddRange(validResults);
-
-        _logger.LogInformation($"Finished OCR. Kept {validResults.Count} valid entries out of {ocrResults.Count} processed.");
+        _logger.LogInformation($"Finished OCR. Found {sortedResults.Count} valid subtitles out of {_bluraySubtitles.Count} processed.");
         return true;
     }
 
@@ -150,7 +151,7 @@ public class PgsOcr
     {
         try
         {
-            // Method 1: Original approach with some improvements
+            // Method 1: Basic approach with Auto page segmentation
             using var engine = new Engine(TesseractDataPath, TesseractLanguage);
             
             if (!string.IsNullOrEmpty(CharacterBlacklist))
@@ -171,16 +172,15 @@ public class PgsOcr
     {
         try
         {
-            // Method 2: Enhanced preprocessing + different settings
-            using var processedBitmap = PreprocessImage(bitmap);
+            // Method 2: Light preprocessing + SingleBlock segmentation
+            using var processedBitmap = PreprocessImageForOcr(bitmap);
             using var engine = new Engine(TesseractDataPath, TesseractLanguage);
-            
-            // More restrictive settings for cleaner text
-            engine.SetVariable("tessedit_char_whitelist", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,!?'-:;()[]{}\"");
-            engine.SetVariable("tessedit_pageseg_mode", "6"); // Single uniform block
             
             if (!string.IsNullOrEmpty(CharacterBlacklist))
                 engine.SetVariable("tessedit_char_blacklist", CharacterBlacklist);
+            
+            // Use SingleBlock for cleaner text extraction
+            engine.SetVariable("tessedit_pageseg_mode", "6");
             
             using var image = GetPix(processedBitmap);
             using var page = engine.Process(image, PageSegMode.SingleBlock);
@@ -193,56 +193,69 @@ public class PgsOcr
         }
     }
 
-    private static Image<Rgba32> PreprocessImage(Image<Rgba32> original)
-    {
-        var processed = original.Clone();
-        
-        processed.Mutate(x => x
-            .Grayscale()           // Convert to grayscale
-            .Contrast(1.5f)        // Increase contrast
-            .GaussianSharpen(0.5f) // Sharpen slightly
-            .Resize(original.Width * 2, original.Height * 2) // Scale up 2x
-        );
-        
-        return processed;
-    }
-
     private string ChooseBestResult(string result1, string result2)
     {
         // If one is empty, return the other
         if (string.IsNullOrWhiteSpace(result1)) return result2 ?? string.Empty;
         if (string.IsNullOrWhiteSpace(result2)) return result1;
 
-        // Prefer longer results (usually more complete)
-        if (result2.Length > result1.Length * 1.3) return result2;
-        if (result1.Length > result2.Length * 1.3) return result1;
+        // Prefer results that seem more like real text
+        var score1 = ScoreTextQuality(result1);
+        var score2 = ScoreTextQuality(result2);
 
-        // Prefer results with fewer artifacts
-        int artifacts1 = CountArtifacts(result1);
-        int artifacts2 = CountArtifacts(result2);
-        
-        if (artifacts1 < artifacts2) return result1;
-        if (artifacts2 < artifacts1) return result2;
-
-        // Default to first result
-        return result1;
+        return score2 > score1 ? result2 : result1;
     }
 
-    private static int CountArtifacts(string text)
+    private static int ScoreTextQuality(string text)
     {
-        if (string.IsNullOrEmpty(text)) return 0;
+        if (string.IsNullOrWhiteSpace(text)) return 0;
+
+        int score = 0;
         
-        int count = 0;
-        foreach (char c in text)
+        // Basic length bonus (longer is often better for subtitles)
+        score += Math.Min(text.Length, 100); // Cap at 100 to avoid just preferring very long garbage
+        
+        // Letter ratio bonus (more letters = better)
+        int letters = text.Count(char.IsLetter);
+        int total = text.Length;
+        if (total > 0)
         {
-            if (c == '|' || c == '~' || c == '^' || c == '*' || c == '#' || 
-                c == '%' || c == '&' || c == '@' || c == '}' || c == '{' || 
-                c == ']' || c == '[')
-            {
-                count++;
-            }
+            double letterRatio = (double)letters / total;
+            score += (int)(letterRatio * 50); // Up to 50 bonus points
         }
-        return count;
+        
+        // Word count bonus (real text has reasonable word breaks)
+        var wordCount = text.Split(new[] { ' ', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries).Length;
+        score += Math.Min(wordCount * 5, 25); // Up to 25 bonus points
+        
+        // Penalty for excessive special characters (not in blacklist, so shouldn't be there)
+        int specialChars = text.Count(c => !char.IsLetterOrDigit(c) && !char.IsWhiteSpace(c) && 
+                                          !".,!?'-:;()[]{}\"".Contains(c));
+        score -= specialChars * 3; // 3 point penalty per bad special char
+        
+        return Math.Max(0, score);
+    }
+
+    private static Image<Rgba32> PreprocessImageForOcr(Image<Rgba32> original)
+    {
+        var processed = original.Clone();
+        
+        try
+        {
+            // Light preprocessing - just grayscale and modest scaling
+            processed.Mutate(x => x
+                .Grayscale()              // Convert to grayscale
+                .Resize(original.Width * 2, original.Height * 2) // Scale up 2x for better OCR
+            );
+        }
+        catch
+        {
+            // If preprocessing fails, return original
+            processed.Dispose();
+            return original.Clone();
+        }
+        
+        return processed;
     }
 
     private static TesseractOCR.Pix.Image GetPix(Image<Rgba32> bitmap)

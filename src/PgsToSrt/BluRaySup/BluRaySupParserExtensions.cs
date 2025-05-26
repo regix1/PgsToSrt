@@ -43,17 +43,10 @@ namespace PgsToSrt.BluRaySup
 
                     var offset = pcsData.PcsObjects[ioIndex].Origin - new Size(r.Location);
                     
-                    try
+                    using var singleBmp = SupDecoder.DecodeImage(pcsData.PcsObjects[ioIndex], pcsData.BitmapObjects[ioIndex], pcsData.PaletteInfos);
+                    if (singleBmp != null && singleBmp.Width > 0 && singleBmp.Height > 0)
                     {
-                        using var singleBmp = SupDecoder.DecodeImage(pcsData.PcsObjects[ioIndex], pcsData.BitmapObjects[ioIndex], pcsData.PaletteInfos);
-                        if (singleBmp != null && singleBmp.Width > 0 && singleBmp.Height > 0)
-                        {
-                            mergedBmp.Mutate(b => b.DrawImage(singleBmp, new Point(offset.X, offset.Y), 1.0f));
-                        }
-                    }
-                    catch (Exception)
-                    {
-                        // Continue processing other objects if one fails
+                        mergedBmp.Mutate(b => b.DrawImage(singleBmp, new Point(offset.X, offset.Y), 1.0f));
                     }
                 }
 
@@ -86,10 +79,6 @@ namespace PgsToSrt.BluRaySup
                 var height = data[0].Size.Height;
                 if (width <= 0 || height <= 0 || data[0].Fragment.ImageBuffer.Length == 0)
                     return new Image<Rgba32>(1, 1);
-
-                // Ensure reasonable size limits
-                width = Math.Min(width, 4096);
-                height = Math.Min(height, 2160);
 
                 using var bmp = new Image<Rgba32>(width, height);
 
@@ -183,14 +172,7 @@ namespace PgsToSrt.BluRaySup
                     }
                 } while (num3 < imageBuffer.Length && num1 < pixelSpan.Length);
 
-                // Create output image with padding
-                var paddedWidth = Math.Min(width + 50, 4096);
-                var paddedHeight = Math.Min(height + 50, 2160);
-                var bmp2 = new Image<Rgba32>(paddedWidth, paddedHeight);
-                
-                bmp2.Mutate(i => i.DrawImage(bmp, new Point(25, 25), 1f));
-
-                return bmp2;
+                return bmp.Clone();
             }
             catch (Exception)
             {
@@ -207,7 +189,7 @@ namespace PgsToSrt.BluRaySup
 
         private static void PutPixel(Span<Rgba32> bmp, int index, Rgba32 color)
         {
-            // BOUNDS CHECK FIX: Only write pixel if index is valid
+            // BOUNDS CHECK: Only write pixel if index is valid
             if (index >= 0 && index < bmp.Length && color.A > 0)
             {
                 bmp[index] = color;

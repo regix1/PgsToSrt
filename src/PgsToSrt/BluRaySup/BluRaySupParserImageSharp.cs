@@ -416,8 +416,8 @@ public static class BluRaySupParserImageSharp
             }
             catch (Exception ex)
             {
-                log.Append($"Error at pos {num3 - buffer1.Length}: {ex.Message}");
-                break; // Exit on serious errors
+                log.AppendLine($"Error at pos {num3 - buffer1.Length}: {ex.Message}");
+                // Continue processing instead of breaking on errors
             }
 
             num1 = num3 + segment.Size;
