@@ -119,13 +119,9 @@ public class PgsOcr
 
         // Sort the results by number and add them to the subtitle
         var sortedResults = ocrResults.OrderBy(p => p.Number).ToList();
-        
-        // Position overlapping subtitles using ASS tags instead of merging
-        var positionedResults = PositionOverlappingSubtitles(sortedResults);
-        
-        _subtitle.Paragraphs.AddRange(positionedResults);
+        _subtitle.Paragraphs.AddRange(sortedResults);
 
-        _logger.LogInformation($"Finished OCR. Found {positionedResults.Count} positioned subtitles out of {_bluraySubtitles.Count} processed.");
+        _logger.LogInformation($"Finished OCR. Found {sortedResults.Count} valid subtitles out of {_bluraySubtitles.Count} processed.");
         return true;
     }
 
