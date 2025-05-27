@@ -283,28 +283,50 @@ public class PgsOcr
         // Calculate time gap between subtitles
         var gap = next.StartTime.TotalMilliseconds - current.EndTime.TotalMilliseconds;
         
-        // Merge if overlapping or very close (within 500ms)
-        if (gap <= 500)
+        // Only merge if overlapping or very close (within 100ms)
+        if (gap <= 100)
         {
             return true;
         }
         
-        // Check for text similarity that suggests they're the same subtitle split
-        if (gap <= 2000) // Within 2 seconds
+        // For slightly larger gaps (up to 1 second), only merge if text is very similar
+        if (gap <= 1000)
         {
             var currentText = current.Text.ToLower().Trim();
             var nextText = next.Text.ToLower().Trim();
             
-            // If one text contains the other, or they start similarly, merge them
-            if (currentText.Contains(nextText) || nextText.Contains(currentText) ||
-                (currentText.Length > 10 && nextText.Length > 10 && 
-                 currentText.Substring(0, Math.Min(10, currentText.Length)) == 
-                 nextText.Substring(0, Math.Min(10, nextText.Length))))
+            // Only merge if texts are very similar (like OCR variants of same text)
+            if (AreTextsVariants(currentText, nextText))
             {
                 return true;
             }
         }
         
+        return false;
+    }
+
+    private static bool AreTextsVariants(string text1, string text2)
+    {
+        // Don't merge if either is very short (likely different content)
+        if (text1.Length < 10 || text2.Length < 10)
+            return false;
+
+        // Don't merge if one is much longer than the other (likely different content)
+        var lengthRatio = (double)Math.Min(text1.Length, text2.Length) / Math.Max(text1.Length, text2.Length);
+        if (lengthRatio < 0.6)
+            return false;
+
+        // Check if one text contains most of the other (80% overlap)
+        if (text1.Contains(text2) && text2.Length >= text1.Length * 0.8)
+            return true;
+        if (text2.Contains(text1) && text1.Length >= text2.Length * 0.8)
+            return true;
+
+        // Check for very similar beginnings (same first 15+ characters)
+        var minStart = Math.Min(15, Math.Min(text1.Length, text2.Length));
+        if (minStart >= 15 && text1.Substring(0, minStart) == text2.Substring(0, minStart))
+            return true;
+
         return false;
     }
 
