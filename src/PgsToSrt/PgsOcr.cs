@@ -290,8 +290,9 @@ public class PgsOcr
         var secondStart = second.StartTime.TotalMilliseconds;
         var secondEnd = second.EndTime.TotalMilliseconds;
         
-        // Check if there's any overlap (not just touching)
-        return firstStart < secondEnd && secondStart < firstEnd;
+        // Check if there's any overlap or if they're very close (within 100ms)
+        var gap = secondStart - firstEnd;
+        return gap <= 100; // They overlap or are very close
     }
 
     private static string AddPositionTag(string text, int overlappingCount)
