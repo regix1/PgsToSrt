@@ -120,12 +120,12 @@ public class PgsOcr
         // Sort the results by number and add them to the subtitle
         var sortedResults = ocrResults.OrderBy(p => p.Number).ToList();
         
-        // Merge subtitles that are too close together or overlapping
-        var mergedResults = MergeCloseSubtitles(sortedResults);
+        // Position overlapping subtitles using ASS tags instead of merging
+        var positionedResults = PositionOverlappingSubtitles(sortedResults);
         
-        _subtitle.Paragraphs.AddRange(mergedResults);
+        _subtitle.Paragraphs.AddRange(positionedResults);
 
-        _logger.LogInformation($"Finished OCR. Found {mergedResults.Count} valid subtitles out of {_bluraySubtitles.Count} processed (merged from {sortedResults.Count}).");
+        _logger.LogInformation($"Finished OCR. Found {positionedResults.Count} positioned subtitles out of {_bluraySubtitles.Count} processed.");
         return true;
     }
 
@@ -239,6 +239,80 @@ public class PgsOcr
         score -= specialChars * 3; // 3 point penalty per bad special char
         
         return Math.Max(0, score);
+    }
+
+    private List<Paragraph> PositionOverlappingSubtitles(List<Paragraph> paragraphs)
+    {
+        if (paragraphs.Count <= 1) return paragraphs;
+
+        var positioned = new List<Paragraph>();
+        
+        for (int i = 0; i < paragraphs.Count; i++)
+        {
+            var current = paragraphs[i];
+            var overlappingCount = 0;
+            
+            // Check how many previous subtitles this one overlaps with
+            for (int j = Math.Max(0, i - 3); j < i; j++) // Only check last 3 subtitles for performance
+            {
+                var previous = paragraphs[j];
+                if (TimingsOverlap(previous, current))
+                {
+                    overlappingCount++;
+                }
+            }
+            
+            // Add positioning tag based on overlap count
+            var positionedText = AddPositionTag(current.Text, overlappingCount);
+            
+            positioned.Add(new Paragraph
+            {
+                Number = current.Number,
+                StartTime = current.StartTime,
+                EndTime = current.EndTime,
+                Text = positionedText
+            });
+        }
+
+        // Renumber the subtitles
+        for (int i = 0; i < positioned.Count; i++)
+        {
+            positioned[i].Number = i + 1;
+        }
+
+        return positioned;
+    }
+
+    private static bool TimingsOverlap(Paragraph first, Paragraph second)
+    {
+        var firstStart = first.StartTime.TotalMilliseconds;
+        var firstEnd = first.EndTime.TotalMilliseconds;
+        var secondStart = second.StartTime.TotalMilliseconds;
+        var secondEnd = second.EndTime.TotalMilliseconds;
+        
+        // Check if there's any overlap (not just touching)
+        return firstStart < secondEnd && secondStart < firstEnd;
+    }
+
+    private static string AddPositionTag(string text, int overlappingCount)
+    {
+        // ASS positioning tags for SRT files
+        var positionTags = new[]
+        {
+            "",           // 0: Default (bottom-center) - no tag needed
+            "{\\an8}",    // 1: Top-center
+            "{\\an7}",    // 2: Top-left  
+            "{\\an9}",    // 3: Top-right
+            "{\\an4}",    // 4: Middle-left
+            "{\\an6}",    // 5: Middle-right
+        };
+        
+        if (overlappingCount > 0 && overlappingCount < positionTags.Length)
+        {
+            return positionTags[overlappingCount] + text;
+        }
+        
+        return text; // Default position (bottom-center)
     }
 
     private List<Paragraph> MergeCloseSubtitles(List<Paragraph> paragraphs)
