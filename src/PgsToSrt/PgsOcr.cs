@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Nikse.SubtitleEdit.Core.Common;
@@ -119,9 +120,13 @@ public class PgsOcr
 
         // Sort the results by number and add them to the subtitle
         var sortedResults = ocrResults.OrderBy(p => p.Number).ToList();
-        _subtitle.Paragraphs.AddRange(sortedResults);
+        
+        // Remove partial duplicates - keep the longer/complete versions
+        var dedupedResults = RemovePartialDuplicates(sortedResults);
+        
+        _subtitle.Paragraphs.AddRange(dedupedResults);
 
-        _logger.LogInformation($"Finished OCR. Found {sortedResults.Count} valid subtitles out of {_bluraySubtitles.Count} processed.");
+        _logger.LogInformation($"Finished OCR. Found {dedupedResults.Count} final subtitles out of {_bluraySubtitles.Count} processed (removed {sortedResults.Count - dedupedResults.Count} partial duplicates).");
         return true;
     }
 
@@ -235,6 +240,104 @@ public class PgsOcr
         score -= specialChars * 3; // 3 point penalty per bad special char
         
         return Math.Max(0, score);
+    }
+
+    private List<Paragraph> RemovePartialDuplicates(List<Paragraph> paragraphs)
+    {
+        if (paragraphs.Count <= 1) return paragraphs;
+
+        var toRemove = new HashSet<int>();
+
+        for (int i = 0; i < paragraphs.Count; i++)
+        {
+            if (toRemove.Contains(i)) continue;
+
+            var current = paragraphs[i];
+            var currentText = current.Text.Trim();
+            
+            // Check the next few subtitles for duplicates (within reasonable time range)
+            for (int j = i + 1; j < Math.Min(i + 10, paragraphs.Count); j++)
+            {
+                if (toRemove.Contains(j)) continue;
+
+                var next = paragraphs[j];
+                var nextText = next.Text.Trim();
+
+                // Skip if timing is too far apart (more than 30 seconds)
+                if (Math.Abs(next.StartTime.TotalMilliseconds - current.StartTime.TotalMilliseconds) > 30000)
+                    break;
+
+                // Check if one text contains the other or if they start the same way
+                if (IsPartialDuplicate(currentText, nextText))
+                {
+                    // Keep the longer, more complete version
+                    if (currentText.Length > nextText.Length)
+                    {
+                        toRemove.Add(j); // Remove the shorter one
+                        _logger.LogDebug($"Removing shorter duplicate #{next.Number}: '{nextText.Substring(0, Math.Min(50, nextText.Length))}...'");
+                    }
+                    else
+                    {
+                        toRemove.Add(i); // Remove the current shorter one
+                        _logger.LogDebug($"Removing shorter duplicate #{current.Number}: '{currentText.Substring(0, Math.Min(50, currentText.Length))}...'");
+                        break; // Current is marked for removal, no need to check further
+                    }
+                }
+            }
+        }
+
+        // Return paragraphs without the ones marked for removal
+        var result = new List<Paragraph>();
+        for (int i = 0; i < paragraphs.Count; i++)
+        {
+            if (!toRemove.Contains(i))
+            {
+                result.Add(paragraphs[i]);
+            }
+        }
+
+        // Renumber the remaining subtitles
+        for (int i = 0; i < result.Count; i++)
+        {
+            result[i].Number = i + 1;
+        }
+
+        return result;
+    }
+
+    private static bool IsPartialDuplicate(string text1, string text2)
+    {
+        if (string.IsNullOrWhiteSpace(text1) || string.IsNullOrWhiteSpace(text2))
+            return false;
+
+        // Normalize whitespace for comparison
+        var normalized1 = System.Text.RegularExpressions.Regex.Replace(text1, @"\s+", " ").Trim();
+        var normalized2 = System.Text.RegularExpressions.Regex.Replace(text2, @"\s+", " ").Trim();
+
+        // If texts are identical, consider it a duplicate
+        if (normalized1.Equals(normalized2, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // If one text completely contains the other, it's a partial duplicate
+        if (normalized1.Contains(normalized2, StringComparison.OrdinalIgnoreCase) ||
+            normalized2.Contains(normalized1, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Check if they start with the same text (at least 20 characters) but one is longer
+        var minLength = Math.Min(normalized1.Length, normalized2.Length);
+        if (minLength >= 20)
+        {
+            var prefix1 = normalized1.Substring(0, minLength);
+            var prefix2 = normalized2.Substring(0, minLength);
+            
+            if (prefix1.Equals(prefix2, StringComparison.OrdinalIgnoreCase) && 
+                Math.Abs(normalized1.Length - normalized2.Length) > 10) // Significant length difference
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private List<Paragraph> PositionOverlappingSubtitles(List<Paragraph> paragraphs)
