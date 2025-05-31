@@ -10,27 +10,30 @@ on:
 
 env:
   DOTNET_VERSION: '8.0.x'
-  PROJECT_PATH: 'PgsToSrt/PgsToSrt.csproj'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runtime: win-x64
-            archive: zip
-          - runtime: linux-x64
-            archive: tar.gz
-          - runtime: osx-x64
-            archive: tar.gz
-          - runtime: osx-arm64
-            archive: tar.gz
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Find project file
+        id: project
+        run: |
+          # Look for the .csproj file
+          if [ -f "PgsToSrt/PgsToSrt.csproj" ]; then
+            echo "path=PgsToSrt/PgsToSrt.csproj" >> $GITHUB_OUTPUT
+          elif [ -f "src/PgsToSrt/PgsToSrt.csproj" ]; then
+            echo "path=src/PgsToSrt/PgsToSrt.csproj" >> $GITHUB_OUTPUT
+          else
+            echo "Project structure:"
+            find . -name "*.csproj" -type f
+            echo "Directory contents:"
+            ls -la
+            exit 1
+          fi
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -49,15 +52,15 @@ jobs:
           echo "Building version: $VERSION"
 
       - name: Restore dependencies
-        run: dotnet restore ${{ env.PROJECT_PATH }}
+        run: dotnet restore ${{ steps.project.outputs.path }}
 
       - name: Build and publish
         run: |
-          dotnet publish ${{ env.PROJECT_PATH }} \
+          dotnet publish ${{ steps.project.outputs.path }} \
             --configuration Release \
-            --runtime ${{ matrix.runtime }} \
+            --runtime linux-x64 \
             --self-contained true \
-            --output ./artifacts/${{ matrix.runtime }} \
+            --output ./artifacts/linux-x64 \
             --verbosity minimal \
             -p:Version=${{ steps.version.outputs.version }} \
             -p:AssemblyVersion=${{ steps.version.outputs.version }}.0 \
@@ -70,59 +73,24 @@ jobs:
 
       - name: Create archive
         run: |
-          cd ./artifacts/${{ matrix.runtime }}
-          if [[ "${{ matrix.archive }}" == "zip" ]]; then
-            zip -r ../../PgsToSrt-${{ steps.version.outputs.version }}-${{ matrix.runtime }}.zip .
-          else
-            tar -czf ../../PgsToSrt-${{ steps.version.outputs.version }}-${{ matrix.runtime }}.tar.gz .
-          fi
+          cd ./artifacts/linux-x64
+          tar -czf ../../PgsToSrt-${{ steps.version.outputs.version }}-linux-x64.tar.gz .
           cd ../..
-          ls -la PgsToSrt-${{ steps.version.outputs.version }}-${{ matrix.runtime }}.*
+          ls -la PgsToSrt-${{ steps.version.outputs.version }}-linux-x64.tar.gz
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: PgsToSrt-${{ steps.version.outputs.version }}-${{ matrix.runtime }}
-          path: PgsToSrt-${{ steps.version.outputs.version }}-${{ matrix.runtime }}.*
-          retention-days: 7
+      - name: Create checksums
+        run: |
+          sha256sum PgsToSrt-${{ steps.version.outputs.version }}-linux-x64.tar.gz > checksums.txt
+          echo "Checksums created:"
+          cat checksums.txt
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: PgsToSrt-${{ steps.version.outputs.version }}-${{ matrix.runtime }}.*
+          files: |
+            PgsToSrt-${{ steps.version.outputs.version }}-linux-x64.tar.gz
+            checksums.txt
           fail_on_unmatched_files: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  create-checksums:
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - name: Extract version from tag
-        id: version
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./downloads
-          merge-multiple: true
-
-      - name: Create checksums
-        run: |
-          cd ./downloads
-          sha256sum PgsToSrt-${{ steps.version.outputs.version }}-*.* > ../checksums.txt
-          cd ..
-          echo "Checksums created:"
-          cat checksums.txt
-
-      - name: Upload checksums to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: checksums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

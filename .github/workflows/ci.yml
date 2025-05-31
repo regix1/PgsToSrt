@@ -1,43 +1,111 @@
 # .github/workflows/ci.yml
-# Builds Docker images on every push to master
-name: ci
+name: CI
+
 on:
   push:
     branches:
       - 'master'
+      - 'main'
+  pull_request:
+    branches:
+      - 'master'
+      - 'main'
+
+env:
+  REGISTRY: ghcr.io
+
 jobs:
-  docker:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: set lower case owner name
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find project file
+        id: project
+        run: |
+          # Look for the .csproj file
+          if [ -f "PgsToSrt/PgsToSrt.csproj" ]; then
+            echo "path=PgsToSrt/PgsToSrt.csproj" >> $GITHUB_OUTPUT
+            echo "Found project at: PgsToSrt/PgsToSrt.csproj"
+          elif [ -f "src/PgsToSrt/PgsToSrt.csproj" ]; then
+            echo "path=src/PgsToSrt/PgsToSrt.csproj" >> $GITHUB_OUTPUT
+            echo "Found project at: src/PgsToSrt/PgsToSrt.csproj"
+          else
+            echo "❌ Could not find PgsToSrt.csproj"
+            echo "Project structure:"
+            find . -name "*.csproj" -type f
+            echo "Directory contents:"
+            ls -la
+            exit 1
+          fi
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore ${{ steps.project.outputs.path }}
+
+      - name: Build
+        run: dotnet build ${{ steps.project.outputs.path }} --configuration Release --no-restore
+
+      - name: Test build artifacts
+        run: |
+          dotnet run --project ${{ steps.project.outputs.path }} -- --help
+          echo "✓ Application runs and shows help"
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set lower case owner name
         run: |
           echo "OWNER_LC=${OWNER,,}" >>${GITHUB_ENV}
         env:
           OWNER: '${{ github.repository_owner }}'
-      -
-        name: Checkout
+
+      - name: Checkout
         uses: actions/checkout@v4
-      -
-        name: Set up QEMU
+
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-      -
-        name: Set up Docker Buildx
+
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      -
-        name: Login to GitHub Container Registry
+
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ env.OWNER_LC }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      -
-        name: Build and push
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/pgstosrt
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64
           push: true
-          tags: |
-            ghcr.io/${{ env.OWNER_LC }}/pgstosrt:latest
-            ghcr.io/${{ env.OWNER_LC }}/pgstosrt:${{ github.ref_name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test Docker image
+        run: |
+          docker run --rm ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/pgstosrt:latest \
+            /bin/bash -c "dotnet /app/PgsToSrt.dll --help"
+          echo "✓ Docker image runs successfully"
