@@ -1,49 +1,128 @@
 # .github/workflows/release.yml
-# Builds .NET binaries for multiple platforms
-name: release
+name: Release
+
 on:
   release:
     types: [published]
   push:
     tags:
       - 'v*'
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  PROJECT_PATH: 'PgsToSrt/PgsToSrt.csproj'
+
 jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        runtime: [win-x64, linux-x64, osx-x64]
+        include:
+          - runtime: win-x64
+            archive: zip
+          - runtime: linux-x64
+            archive: tar.gz
+          - runtime: osx-x64
+            archive: tar.gz
+          - runtime: osx-arm64
+            archive: tar.gz
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
-      
-      - name: Build Release
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Extract version from tag
+        id: version
         run: |
-          dotnet publish src/PgsToSrt \
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.PROJECT_PATH }}
+
+      - name: Build and publish
+        run: |
+          dotnet publish ${{ env.PROJECT_PATH }} \
             --configuration Release \
             --runtime ${{ matrix.runtime }} \
             --self-contained true \
-            --output ./release-${{ matrix.runtime }} \
-            -p:PublishSingleFile=false \
-            -p:PublishReadyToRun=false
-      
-      - name: Create Release Archive
+            --output ./artifacts/${{ matrix.runtime }} \
+            --verbosity minimal \
+            -p:Version=${{ steps.version.outputs.version }} \
+            -p:AssemblyVersion=${{ steps.version.outputs.version }}.0 \
+            -p:FileVersion=${{ steps.version.outputs.version }}.0 \
+            -p:PublishSingleFile=true \
+            -p:PublishTrimmed=true \
+            -p:TrimMode=partial \
+            -p:DebugType=None \
+            -p:DebugSymbols=false
+
+      - name: Create archive
         run: |
-          cd release-${{ matrix.runtime }}
-          if [[ "${{ matrix.runtime }}" == win-* ]]; then
-            zip -r ../PgsToSrt-${{ github.ref_name }}-${{ matrix.runtime }}.zip .
+          cd ./artifacts/${{ matrix.runtime }}
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            zip -r ../../PgsToSrt-${{ steps.version.outputs.version }}-${{ matrix.runtime }}.zip .
           else
-            tar -czf ../PgsToSrt-${{ github.ref_name }}-${{ matrix.runtime }}.tar.gz .
+            tar -czf ../../PgsToSrt-${{ steps.version.outputs.version }}-${{ matrix.runtime }}.tar.gz .
           fi
-      
-      - name: Upload Release Asset
-        uses: softprops/action-gh-release@v1
+          cd ../..
+          ls -la PgsToSrt-${{ steps.version.outputs.version }}-${{ matrix.runtime }}.*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: PgsToSrt-${{ github.ref_name }}-${{ matrix.runtime }}.*
+          name: PgsToSrt-${{ steps.version.outputs.version }}-${{ matrix.runtime }}
+          path: PgsToSrt-${{ steps.version.outputs.version }}-${{ matrix.runtime }}.*
+          retention-days: 7
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: PgsToSrt-${{ steps.version.outputs.version }}-${{ matrix.runtime }}.*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  create-checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./downloads
+          merge-multiple: true
+
+      - name: Create checksums
+        run: |
+          cd ./downloads
+          sha256sum PgsToSrt-${{ steps.version.outputs.version }}-*.* > ../checksums.txt
+          cd ..
+          echo "Checksums created:"
+          cat checksums.txt
+
+      - name: Upload checksums to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: checksums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

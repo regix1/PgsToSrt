@@ -22,6 +22,15 @@ if [[ -n "${TESSDATA}" ]]; then
 else
   args+=('--tesseractdata' '/tessdata')
 fi
+if [[ -n "${CHARACTER_BLACKLIST}" ]]; then
+  args+=('--blacklist' "${CHARACTER_BLACKLIST}")
+fi
+if [[ -n "${SHORT_THRESHOLD}" ]]; then
+  args+=('--short-threshold' "${SHORT_THRESHOLD}")
+fi
+if [[ -n "${EXTEND_TO}" ]]; then
+  args+=('--extend-to' "${EXTEND_TO}")
+fi
 
 args+=('--tesseractversion' '5')
   
