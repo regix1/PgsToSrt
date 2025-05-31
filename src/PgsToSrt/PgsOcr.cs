@@ -134,18 +134,148 @@ public class PgsOcr
             return string.Empty;
         }
 
-        // Try basic OCR first
-        var basicResult = PerformOcr(bitmap, PageSegMode.Auto);
-        if (IsGoodResult(basicResult))
+        // Try multiple OCR approaches for better multi-region text detection
+        var results = new List<string>();
+
+        // Method 1: Top 3 most effective page segmentation modes for multi-region text
+        var pageModes = new[] { 
+            PageSegMode.SparseText,     // PSM_SPARSE_TEXT (11) - **PRIMARY: "Find as much text as possible in no particular order"**
+            PageSegMode.Auto,           // PSM_AUTO (3) - Fully automatic page segmentation (reliable fallback)
+            PageSegMode.RawLine         // PSM_RAW_LINE (13) - Good for multiple independent lines
+        };
+
+        foreach (var mode in pageModes)
         {
-            return basicResult;
+            var result = PerformOcr(bitmap, mode);
+            if (!string.IsNullOrWhiteSpace(result))
+            {
+                results.Add(result);
+                _logger.LogDebug($"OCR Mode {mode} found text: {result.Substring(0, Math.Min(50, result.Length))}...");
+            }
         }
 
-        // Try with enhanced preprocessing
-        using var processed = EnhanceImage(bitmap);
-        var processedResult = PerformOcr(processed, PageSegMode.SingleBlock);
-        
-        return ChooseBestResult(basicResult, processedResult);
+        // Method 2: Enhanced image processing with different approaches
+        try
+        {
+            // **PRIORITY: Enhanced SparseText processing for multi-region detection**
+            using var enhanced1 = EnhanceImageGentle(bitmap);
+            var enhancedResult1 = PerformOcr(enhanced1, PageSegMode.SparseText);
+            if (!string.IsNullOrWhiteSpace(enhancedResult1))
+            {
+                results.Add(enhancedResult1);
+            }
+
+            // High contrast SparseText for faint scattered text
+            using var enhanced2 = EnhanceImageHighContrast(bitmap);
+            var enhancedResult2 = PerformOcr(enhanced2, PageSegMode.SparseText);
+            if (!string.IsNullOrWhiteSpace(enhancedResult2))
+            {
+                results.Add(enhancedResult2);
+            }
+
+            // Large scale SparseText for small scattered text regions
+            using var enhanced3 = EnhanceImageLargeScale(bitmap);
+            var enhancedResult3 = PerformOcr(enhanced3, PageSegMode.SparseText);
+            if (!string.IsNullOrWhiteSpace(enhancedResult3))
+            {
+                results.Add(enhancedResult3);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug($"Image enhancement failed: {ex.Message}");
+        }
+
+        // Choose the best result or combine multiple results
+        return SelectBestResult(results);
+    }
+
+    private string SelectBestResult(List<string> results)
+    {
+        if (results.Count == 0) return string.Empty;
+        if (results.Count == 1) return results[0];
+
+        // Score each result and find the best one
+        var scoredResults = results.Select((r, index) => new { 
+                Text = r, 
+                Score = CalculateTextScore(r),
+                Index = index
+            })
+            .Where(r => r.Score > 0)
+            .OrderByDescending(r => r.Score)
+            .ToList();
+
+        if (scoredResults.Count == 0) return string.Empty;
+
+        var bestResult = scoredResults[0].Text;
+        _logger.LogDebug($"Selected best OCR result (score: {scoredResults[0].Score}): {bestResult.Substring(0, Math.Min(50, bestResult.Length))}...");
+
+        // Try to combine results if they seem to complement each other
+        if (scoredResults.Count > 1)
+        {
+            var combinedResult = TryCombineResults(scoredResults.Take(3).Select(r => r.Text).ToList());
+            var combinedScore = CalculateTextScore(combinedResult);
+            if (combinedScore > scoredResults[0].Score)
+            {
+                _logger.LogDebug($"Combined result better (score: {combinedScore}): {combinedResult.Substring(0, Math.Min(50, combinedResult.Length))}...");
+                return combinedResult;
+            }
+        }
+
+        return bestResult;
+    }
+
+    private string TryCombineResults(List<string> results)
+    {
+        if (results.Count <= 1) return results.FirstOrDefault() ?? string.Empty;
+
+        // Split each result into lines
+        var allLines = new List<string>();
+        foreach (var result in results)
+        {
+            var lines = result.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                             .Select(l => l.Trim())
+                             .Where(l => !string.IsNullOrEmpty(l))
+                             .ToList();
+            allLines.AddRange(lines);
+        }
+
+        // Remove duplicates while preserving order
+        var uniqueLines = new List<string>();
+        foreach (var line in allLines)
+        {
+            if (!uniqueLines.Any(existing => AreSimilarLines(existing, line)))
+            {
+                uniqueLines.Add(line);
+            }
+        }
+
+        return string.Join("\n", uniqueLines);
+    }
+
+    private static bool AreSimilarLines(string line1, string line2)
+    {
+        if (string.IsNullOrWhiteSpace(line1) || string.IsNullOrWhiteSpace(line2))
+            return false;
+
+        var normalized1 = NormalizeText(line1);
+        var normalized2 = NormalizeText(line2);
+
+        // Exact match
+        if (normalized1.Equals(normalized2, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // One contains the other (with at least 80% overlap)
+        if (Math.Min(normalized1.Length, normalized2.Length) >= 5)
+        {
+            var longer = normalized1.Length > normalized2.Length ? normalized1 : normalized2;
+            var shorter = normalized1.Length > normalized2.Length ? normalized2 : normalized1;
+            
+            return longer.Contains(shorter, StringComparison.OrdinalIgnoreCase) && 
+                   (double)shorter.Length / longer.Length >= 0.8;
+        }
+
+        return false;
     }
 
     private Image<Rgba32> GetBitmap(BluRaySupParserImageSharp.PcsData subtitle)
@@ -166,7 +296,7 @@ public class PgsOcr
         try
         {
             using var engine = new Engine(TesseractDataPath, TesseractLanguage);
-            ConfigureEngine(engine);
+            ConfigureEngine(engine, pageSegMode);
             
             using var pixImage = ConvertToPix(image);
             using var page = engine.Process(pixImage, pageSegMode);
@@ -180,7 +310,7 @@ public class PgsOcr
         }
     }
 
-    private void ConfigureEngine(Engine engine)
+    private void ConfigureEngine(Engine engine, PageSegMode pageSegMode)
     {
         try
         {
@@ -195,10 +325,38 @@ public class PgsOcr
             engine.SetVariable("tessedit_create_pdf", "0");
             engine.SetVariable("tessedit_write_images", "0");
             
-            // Improve text recognition
+            // Improve text recognition for multiple regions
             engine.SetVariable("classify_enable_learning", "0");
             engine.SetVariable("classify_enable_adaptive_matcher", "1");
-            engine.SetVariable("textord_really_old_xheight", "1");
+            
+            // Settings optimized for different page segmentation modes
+            if (pageSegMode == PageSegMode.SparseText)
+            {
+                // **OPTIMAL SETTINGS FOR SPARSE TEXT** - Find as much text as possible
+                engine.SetVariable("textord_really_old_xheight", "0");
+                engine.SetVariable("textord_min_linesize", "0.5");
+                engine.SetVariable("preserve_interword_spaces", "1");
+                engine.SetVariable("tessedit_zero_rejection", "0");
+                engine.SetVariable("textord_force_make_prop_words", "0");
+                engine.SetVariable("textord_chopper_test", "0");
+                // Additional sparse text optimizations
+                engine.SetVariable("textord_noise_sizelimit", "0.5");
+                engine.SetVariable("textord_noise_normratio", "2");
+                engine.SetVariable("textord_baseline_debug", "0");
+            }
+            else if (pageSegMode == PageSegMode.RawLine || pageSegMode == PageSegMode.SingleLine)
+            {
+                // Settings for line-based detection
+                engine.SetVariable("textord_really_old_xheight", "0");
+                engine.SetVariable("textord_min_linesize", "1.0");
+                engine.SetVariable("preserve_interword_spaces", "1");
+                engine.SetVariable("tessedit_zero_rejection", "0");
+            }
+            else
+            {
+                // Standard settings for block text
+                engine.SetVariable("textord_really_old_xheight", "1");
+            }
             
             // Reduce word penalties for better subtitle recognition
             engine.SetVariable("language_model_penalty_non_dict_word", "0.8");
@@ -217,7 +375,29 @@ public class PgsOcr
         return TesseractOCR.Pix.Image.LoadFromMemory(stream.ToArray());
     }
 
-    private static Image<Rgba32> EnhanceImage(Image<Rgba32> original)
+    // Gentle enhancement that preserves multiple text regions
+    private static Image<Rgba32> EnhanceImageGentle(Image<Rgba32> original)
+    {
+        var enhanced = original.Clone();
+        
+        try
+        {
+            enhanced.Mutate(x => x
+                .Resize(original.Width * 3, original.Height * 3, KnownResamplers.Lanczos3)
+                .GaussianSharpen(0.3f)  // Very light sharpening
+                .Contrast(1.05f));      // Minimal contrast boost
+            
+            return enhanced;
+        }
+        catch
+        {
+            enhanced?.Dispose();
+            return original.Clone();
+        }
+    }
+
+    // High contrast enhancement for faint text
+    private static Image<Rgba32> EnhanceImageHighContrast(Image<Rgba32> original)
     {
         var enhanced = original.Clone();
         
@@ -226,7 +406,28 @@ public class PgsOcr
             enhanced.Mutate(x => x
                 .Grayscale()
                 .Resize(original.Width * 2, original.Height * 2, KnownResamplers.Lanczos3)
-                .GaussianSharpen(0.8f)
+                .Contrast(1.3f)         // High contrast
+                .GaussianSharpen(0.6f)); // Medium sharpening
+            
+            return enhanced;
+        }
+        catch
+        {
+            enhanced?.Dispose();
+            return original.Clone();
+        }
+    }
+
+    // Large scale enhancement for small text
+    private static Image<Rgba32> EnhanceImageLargeScale(Image<Rgba32> original)
+    {
+        var enhanced = original.Clone();
+        
+        try
+        {
+            enhanced.Mutate(x => x
+                .Resize(original.Width * 4, original.Height * 4, KnownResamplers.Lanczos3)
+                .GaussianSharpen(0.4f)
                 .Contrast(1.1f));
             
             return enhanced;
@@ -269,25 +470,30 @@ public class PgsOcr
         var score = 0;
         
         // Length bonus (capped)
-        score += Math.Min(text.Length * 2, 100);
+        score += Math.Min(text.Length * 2, 150);
         
         // Letter ratio bonus - higher weight for good text
         var letterCount = text.Count(char.IsLetter);
         var letterRatio = (double)letterCount / text.Length;
-        score += (int)(letterRatio * 80);
+        score += (int)(letterRatio * 100);
+        
+        // Line count bonus (for multi-line subtitles)
+        var lines = text.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+        var validLines = lines.Count(line => line.Trim().Length > 2);
+        score += validLines * 25; // Bonus for multiple valid lines
         
         // Word count bonus
         var words = text.Split(new[] { ' ', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-        score += Math.Min(words.Length * 12, 60);
+        score += Math.Min(words.Length * 15, 80);
         
         // Penalty for excessive special characters
         var badChars = text.Count(c => !char.IsLetterOrDigit(c) && !char.IsWhiteSpace(c) && 
                                       !".,!?'-:;()[]{}\"&$%@#*/+=<>".Contains(c));
-        score -= badChars * 8;
+        score -= badChars * 6;
         
         // Bonus for proper sentence structure
-        if (char.IsUpper(text[0]))
-            score += 15;
+        if (lines.Length > 0 && lines[0].Length > 0 && char.IsUpper(lines[0][0]))
+            score += 20;
         
         return Math.Max(0, score);
     }
