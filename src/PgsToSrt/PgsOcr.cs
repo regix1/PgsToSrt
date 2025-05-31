@@ -240,42 +240,19 @@ public class PgsOcr
             allLines.AddRange(lines);
         }
 
-        // Remove duplicates while preserving order
+        // Remove exact duplicates only
         var uniqueLines = new List<string>();
         foreach (var line in allLines)
         {
-            if (!uniqueLines.Any(existing => AreSimilarLines(existing, line)))
+            // Only remove if it's an exact match (case-insensitive)
+            if (!uniqueLines.Any(existing => 
+                string.Equals(existing, line, StringComparison.OrdinalIgnoreCase)))
             {
                 uniqueLines.Add(line);
             }
         }
 
         return string.Join("\n", uniqueLines);
-    }
-
-    private static bool AreSimilarLines(string line1, string line2)
-    {
-        if (string.IsNullOrWhiteSpace(line1) || string.IsNullOrWhiteSpace(line2))
-            return false;
-
-        var normalized1 = NormalizeText(line1);
-        var normalized2 = NormalizeText(line2);
-
-        // Exact match
-        if (normalized1.Equals(normalized2, StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        // One contains the other (with at least 80% overlap)
-        if (Math.Min(normalized1.Length, normalized2.Length) >= 5)
-        {
-            var longer = normalized1.Length > normalized2.Length ? normalized1 : normalized2;
-            var shorter = normalized1.Length > normalized2.Length ? normalized2 : normalized1;
-            
-            return longer.Contains(shorter, StringComparison.OrdinalIgnoreCase) && 
-                   (double)shorter.Length / longer.Length >= 0.8;
-        }
-
-        return false;
     }
 
     private Image<Rgba32> GetBitmap(BluRaySupParserImageSharp.PcsData subtitle)
@@ -437,29 +414,6 @@ public class PgsOcr
             enhanced?.Dispose();
             return original.Clone();
         }
-    }
-
-    private static bool IsGoodResult(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-            return false;
-
-        // Consider it good if it's reasonably long and has mostly valid characters
-        var letterCount = text.Count(char.IsLetter);
-        var totalCount = text.Length;
-        
-        return text.Length >= 3 && (double)letterCount / totalCount >= 0.5;
-    }
-
-    private static string ChooseBestResult(string result1, string result2)
-    {
-        if (string.IsNullOrWhiteSpace(result1)) return result2 ?? string.Empty;
-        if (string.IsNullOrWhiteSpace(result2)) return result1;
-
-        var score1 = CalculateTextScore(result1);
-        var score2 = CalculateTextScore(result2);
-
-        return score2 > score1 ? result2 : result1;
     }
 
     private static int CalculateTextScore(string text)
