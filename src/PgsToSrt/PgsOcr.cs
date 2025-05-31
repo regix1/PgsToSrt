@@ -240,19 +240,75 @@ public class PgsOcr
             allLines.AddRange(lines);
         }
 
-        // Remove exact duplicates only
+        // Remove duplicates and near-duplicates
         var uniqueLines = new List<string>();
         foreach (var line in allLines)
         {
-            // Only remove if it's an exact match (case-insensitive)
-            if (!uniqueLines.Any(existing => 
-                string.Equals(existing, line, StringComparison.OrdinalIgnoreCase)))
+            if (!IsDuplicateLine(line, uniqueLines))
             {
                 uniqueLines.Add(line);
             }
         }
 
         return string.Join("\n", uniqueLines);
+    }
+
+    private static bool IsDuplicateLine(string newLine, List<string> existingLines)
+    {
+        foreach (var existing in existingLines)
+        {
+            // Exact match
+            if (string.Equals(existing, newLine, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // Check for near-duplicates (OCR errors, truncation)
+            if (AreSimilarLines(existing, newLine))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool AreSimilarLines(string line1, string line2)
+    {
+        if (string.IsNullOrWhiteSpace(line1) || string.IsNullOrWhiteSpace(line2))
+            return false;
+
+        var clean1 = CleanForComparison(line1);
+        var clean2 = CleanForComparison(line2);
+
+        // Exact match after cleaning
+        if (clean1.Equals(clean2, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // One is a substring of the other (truncation)
+        if (clean1.Length >= 10 && clean2.Length >= 10)
+        {
+            var longer = clean1.Length > clean2.Length ? clean1 : clean2;
+            var shorter = clean1.Length > clean2.Length ? clean2 : clean1;
+            
+            // If one contains the other and they're similar enough
+            if (longer.Contains(shorter, StringComparison.OrdinalIgnoreCase))
+            {
+                double similarity = (double)shorter.Length / longer.Length;
+                return similarity >= 0.75; // 75% similarity threshold
+            }
+        }
+
+        return false;
+    }
+
+    private static string CleanForComparison(string text)
+    {
+        // Remove common OCR artifacts for comparison
+        return text.Replace("Iit", "it")
+                  .Replace("II", "l")
+                  .Replace("0", "O")
+                  .Replace("1", "l")
+                  .Replace(".", "")
+                  .Replace(",", "")
+                  .Replace("!", "")
+                  .Replace("?", "")
+                  .Trim();
     }
 
     private Image<Rgba32> GetBitmap(BluRaySupParserImageSharp.PcsData subtitle)
@@ -464,10 +520,13 @@ public class PgsOcr
             
             var currentDuration = endTime.TotalMilliseconds - startTime.TotalMilliseconds;
             
-            // Extend short subtitles if configured
-            if (ShortThreshold > 0 && ExtendTo > 0 && currentDuration < ShortThreshold)
+            // Calculate minimum duration based on text content
+            var minDuration = CalculateMinimumDuration(result.Text);
+            
+            // Extend subtitle if it's too short for the content
+            if (currentDuration < minDuration)
             {
-                var newEndTime = startTime.TotalMilliseconds + ExtendTo;
+                var newEndTime = startTime.TotalMilliseconds + minDuration;
                 
                 // Check if extending would overlap with next subtitle
                 if (i + 1 < results.Count)
@@ -482,7 +541,7 @@ public class PgsOcr
                 if (newEndTime > startTime.TotalMilliseconds)
                 {
                     endTime = new TimeCode(newEndTime);
-                    _logger.LogDebug($"Extended short subtitle {i + 1} from {currentDuration}ms to {endTime.TotalMilliseconds - startTime.TotalMilliseconds}ms");
+                    _logger.LogDebug($"Extended subtitle {i + 1} from {currentDuration}ms to {endTime.TotalMilliseconds - startTime.TotalMilliseconds}ms for content length");
                 }
             }
             
@@ -496,6 +555,28 @@ public class PgsOcr
         }
         
         return paragraphs;
+    }
+
+    private int CalculateMinimumDuration(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return ShortThreshold;
+
+        // Count lines and characters
+        var lines = text.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+        var characterCount = text.Length;
+        
+        // Base reading time: 250ms per line + 50ms per character
+        var baseDuration = (lines.Length * 250) + (characterCount * 50);
+        
+        // Minimum durations
+        var minForLines = lines.Length * 1500; // 1.5 seconds per line minimum
+        var configuredMin = ShortThreshold > 0 ? ShortThreshold : 1200;
+        var configuredExtend = ExtendTo > 0 ? ExtendTo : 2000;
+        
+        // Use the maximum of all calculations
+        return Math.Max(Math.Max(baseDuration, minForLines), 
+                       Math.Max(configuredMin, configuredExtend));
     }
 
     private List<Paragraph> RemoveDuplicates(List<Paragraph> paragraphs)
@@ -571,17 +652,8 @@ public class PgsOcr
         if (normalized1.Equals(normalized2, StringComparison.OrdinalIgnoreCase))
             return true;
 
-        // One contains the other (for partial duplicates)
-        if (normalized1.Length >= 10 && normalized2.Length >= 10)
-        {
-            var longer = normalized1.Length > normalized2.Length ? normalized1 : normalized2;
-            var shorter = normalized1.Length > normalized2.Length ? normalized2 : normalized1;
-            
-            if (longer.Contains(shorter, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-
-        return false;
+        // Use the same similarity detection as line comparison
+        return AreSimilarLines(text1, text2);
     }
 
     private static string NormalizeText(string text)
