@@ -90,21 +90,38 @@ jobs:
             sudo apt-get update && sudo apt-get install -y jq
           fi
           
-          # Get the release ID
-          RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.ref_name }}" | \
-            jq -r '.id // empty')
+          echo "Checking for existing release: ${{ github.ref_name }}"
           
-          if [ ! -z "$RELEASE_ID" ]; then
-            echo "Found existing release: $RELEASE_ID"
-            # Get existing assets
-            curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets" | \
-              jq -r '.[].id' | while read asset_id; do
+          # Get release info with better error handling
+          RELEASE_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.ref_name }}")
+          
+          RELEASE_ID=$(echo "$RELEASE_INFO" | jq -r '.id // empty')
+          
+          if [ ! -z "$RELEASE_ID" ] && [ "$RELEASE_ID" != "null" ] && [ "$RELEASE_ID" != "empty" ]; then
+            echo "Found existing release with ID: $RELEASE_ID"
+            
+            # Get and delete existing assets with retry logic
+            ASSETS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets")
+            
+            echo "Assets response: $ASSETS"
+            
+            echo "$ASSETS" | jq -r '.[].id // empty' | while read -r asset_id; do
+              if [ ! -z "$asset_id" ] && [ "$asset_id" != "null" ] && [ "$asset_id" != "empty" ]; then
                 echo "Deleting asset: $asset_id"
-                curl -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                  "https://api.github.com/repos/${{ github.repository }}/releases/assets/$asset_id"
-              done
+                curl -X DELETE -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                  "https://api.github.com/repos/${{ github.repository }}/releases/assets/$asset_id" || {
+                  echo "Failed to delete asset $asset_id, continuing..."
+                }
+                sleep 1  # Small delay between deletions
+              fi
+            done
+            
+            echo "Waiting for asset deletions to propagate..."
+            sleep 10  # Longer wait for GitHub API to sync
+          else
+            echo "No existing release found (ID: '$RELEASE_ID')"
           fi
 
       - name: Upload to release
@@ -115,5 +132,10 @@ jobs:
             PgsToSrt-${{ steps.version.outputs.version }}-linux-x64.tar.gz
             checksums.txt
           fail_on_unmatched_files: true
+          make_latest: true
+          draft: false
+          prerelease: false
+          name: "PgsToSrt ${{ steps.version.outputs.version }}"
+          tag_name: ${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
