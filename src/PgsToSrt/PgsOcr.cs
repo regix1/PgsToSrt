@@ -28,6 +28,7 @@ public class PgsOcr
     public string TesseractDataPath { get; set; }
     public string TesseractLanguage { get; set; } = "eng";
     public string CharacterBlacklist { get; set; }
+    public int MinDuration { get; set; } = 500; // Default 500ms
 
     public PgsOcr(Microsoft.Extensions.Logging.ILogger logger, string tesseractVersion, string libLeptName, string libLeptVersion)
     {
@@ -51,6 +52,11 @@ public class PgsOcr
         if (!string.IsNullOrEmpty(CharacterBlacklist))
         {
             _logger.LogInformation($"Character blacklist: '{CharacterBlacklist}'");
+        }
+
+        if (MinDuration > 0)
+        {
+            _logger.LogInformation($"Minimum subtitle duration: {MinDuration}ms");
         }
 
         // Initialize Tesseract
@@ -231,8 +237,6 @@ public class PgsOcr
         }
     }
 
-
-
     private static bool IsGoodResult(string text)
     {
         if (string.IsNullOrWhiteSpace(text))
@@ -287,18 +291,46 @@ public class PgsOcr
         return Math.Max(0, score);
     }
 
-    private static List<Paragraph> ConvertToParagraphs(List<OcrResult> results)
+    private List<Paragraph> ConvertToParagraphs(List<OcrResult> results)
     {
         var paragraphs = new List<Paragraph>();
         
         for (int i = 0; i < results.Count; i++)
         {
             var result = results[i];
+            var startTime = new TimeCode(result.StartTime / 90.0);
+            var endTime = new TimeCode(result.EndTime / 90.0);
+            
+            // Expand short subtitles if MinDuration is set
+            if (MinDuration > 0)
+            {
+                var currentDuration = endTime.TotalMilliseconds - startTime.TotalMilliseconds;
+                if (currentDuration < MinDuration)
+                {
+                    var newEndTime = startTime.TotalMilliseconds + MinDuration;
+                    
+                    // Check if extending would overlap with next subtitle
+                    if (i + 1 < results.Count)
+                    {
+                        var nextStartTime = new TimeCode(results[i + 1].StartTime / 90.0).TotalMilliseconds;
+                        if (newEndTime > nextStartTime - 100) // Leave 100ms gap
+                        {
+                            newEndTime = nextStartTime - 100;
+                        }
+                    }
+                    
+                    if (newEndTime > startTime.TotalMilliseconds)
+                    {
+                        endTime = new TimeCode(newEndTime);
+                    }
+                }
+            }
+            
             paragraphs.Add(new Paragraph
             {
                 Number = i + 1,
-                StartTime = new TimeCode(result.StartTime / 90.0),
-                EndTime = new TimeCode(result.EndTime / 90.0),
+                StartTime = startTime,
+                EndTime = endTime,
                 Text = result.Text
             });
         }

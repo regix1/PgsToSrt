@@ -22,6 +22,7 @@ namespace PgsToSrt
         private string _libLeptName;
         private string _libLeptVersion;
         private string _characterBlacklist;
+        private int _minDuration;
 
         public Runner(ILogger<Runner> logger)
         {
@@ -54,6 +55,7 @@ namespace PgsToSrt
             var track = values.Value.Track;
 
             _characterBlacklist = values.Value.CharacterBlacklist;
+            _minDuration = values.Value.MinDuration;
 
             // Windows uses tesseract50.dll installed by nuget package, so always use v5
             // Other systems can uses different libtesseract versions, keep v4 as default.
@@ -143,7 +145,8 @@ namespace PgsToSrt
             {
                 TesseractDataPath = _tesseractData,
                 TesseractLanguage = _tesseractLanguage,
-                CharacterBlacklist = _characterBlacklist
+                CharacterBlacklist = _characterBlacklist,
+                MinDuration = _minDuration
             };
 
             pgsOcr.ToSrt(subtitles, output);

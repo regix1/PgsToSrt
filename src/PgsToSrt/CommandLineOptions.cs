@@ -33,5 +33,8 @@ namespace PgsToSrt
 
         [Option('b', "blacklist", Required = false, HelpText = "Character blacklist to improve OCR (e.g., \"|\\/`_~<>\")")]
         public string CharacterBlacklist { get; set; }
+
+        [Option('d', "minduration", Required = false, HelpText = "Minimum subtitle duration in milliseconds (default: 500)", Default = 500)]
+        public int MinDuration { get; set; }
     }
 }
