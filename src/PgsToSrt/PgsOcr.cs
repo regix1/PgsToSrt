@@ -28,7 +28,8 @@ public class PgsOcr
     public string TesseractDataPath { get; set; }
     public string TesseractLanguage { get; set; } = "eng";
     public string CharacterBlacklist { get; set; }
-    public int MinDuration { get; set; } = 500; // Default 500ms
+    public int ShortThreshold { get; set; } = 300; // Default 300ms
+    public int ExtendTo { get; set; } = 1200; // Default 1200ms
 
     public PgsOcr(Microsoft.Extensions.Logging.ILogger logger, string tesseractVersion, string libLeptName, string libLeptVersion)
     {
@@ -54,9 +55,9 @@ public class PgsOcr
             _logger.LogInformation($"Character blacklist: '{CharacterBlacklist}'");
         }
 
-        if (MinDuration > 0)
+        if (ShortThreshold > 0 && ExtendTo > 0)
         {
-            _logger.LogInformation($"Minimum subtitle duration: {MinDuration}ms");
+            _logger.LogInformation($"Short subtitle extension: subtitles < {ShortThreshold}ms will be extended to {ExtendTo}ms");
         }
 
         // Initialize Tesseract
@@ -301,28 +302,27 @@ public class PgsOcr
             var startTime = new TimeCode(result.StartTime / 90.0);
             var endTime = new TimeCode(result.EndTime / 90.0);
             
-            // Expand short subtitles if MinDuration is set
-            if (MinDuration > 0)
+            var currentDuration = endTime.TotalMilliseconds - startTime.TotalMilliseconds;
+            
+            // Extend short subtitles if configured
+            if (ShortThreshold > 0 && ExtendTo > 0 && currentDuration < ShortThreshold)
             {
-                var currentDuration = endTime.TotalMilliseconds - startTime.TotalMilliseconds;
-                if (currentDuration < MinDuration)
+                var newEndTime = startTime.TotalMilliseconds + ExtendTo;
+                
+                // Check if extending would overlap with next subtitle
+                if (i + 1 < results.Count)
                 {
-                    var newEndTime = startTime.TotalMilliseconds + MinDuration;
-                    
-                    // Check if extending would overlap with next subtitle
-                    if (i + 1 < results.Count)
+                    var nextStartTime = new TimeCode(results[i + 1].StartTime / 90.0).TotalMilliseconds;
+                    if (newEndTime > nextStartTime - 200) // Leave 200ms gap
                     {
-                        var nextStartTime = new TimeCode(results[i + 1].StartTime / 90.0).TotalMilliseconds;
-                        if (newEndTime > nextStartTime - 100) // Leave 100ms gap
-                        {
-                            newEndTime = nextStartTime - 100;
-                        }
+                        newEndTime = nextStartTime - 200;
                     }
-                    
-                    if (newEndTime > startTime.TotalMilliseconds)
-                    {
-                        endTime = new TimeCode(newEndTime);
-                    }
+                }
+                
+                if (newEndTime > startTime.TotalMilliseconds)
+                {
+                    endTime = new TimeCode(newEndTime);
+                    _logger.LogDebug($"Extended short subtitle {i + 1} from {currentDuration}ms to {endTime.TotalMilliseconds - startTime.TotalMilliseconds}ms");
                 }
             }
             
