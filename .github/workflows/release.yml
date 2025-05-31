@@ -66,8 +66,6 @@ jobs:
             -p:AssemblyVersion=${{ steps.version.outputs.version }}.0 \
             -p:FileVersion=${{ steps.version.outputs.version }}.0 \
             -p:PublishSingleFile=true \
-            -p:PublishTrimmed=true \
-            -p:TrimMode=partial \
             -p:DebugType=None \
             -p:DebugSymbols=false
 
@@ -83,6 +81,31 @@ jobs:
           sha256sum PgsToSrt-${{ steps.version.outputs.version }}-linux-x64.tar.gz > checksums.txt
           echo "Checksums created:"
           cat checksums.txt
+
+      - name: Delete existing release assets (if any)
+        continue-on-error: true
+        run: |
+          # Install jq if not available
+          if ! command -v jq &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+          
+          # Get the release ID
+          RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.ref_name }}" | \
+            jq -r '.id // empty')
+          
+          if [ ! -z "$RELEASE_ID" ]; then
+            echo "Found existing release: $RELEASE_ID"
+            # Get existing assets
+            curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets" | \
+              jq -r '.[].id' | while read asset_id; do
+                echo "Deleting asset: $asset_id"
+                curl -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                  "https://api.github.com/repos/${{ github.repository }}/releases/assets/$asset_id"
+              done
+          fi
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
