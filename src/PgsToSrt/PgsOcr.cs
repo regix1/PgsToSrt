@@ -27,7 +27,8 @@ public class PgsOcr
     public string TesseractDataPath { get; set; }
     public string TesseractLanguage { get; set; } = "eng";
     public string CharacterBlacklist { get; set; }
-    public int MinDurationMs { get; set; } = 1000;
+    public int ShortThreshold { get; set; } = 300;
+    public int ExtendTo { get; set; } = 1200;
 
     public PgsOcr(Microsoft.Extensions.Logging.ILogger logger, string tesseractVersion, string libLeptName, string libLeptVersion)
     {
@@ -51,6 +52,11 @@ public class PgsOcr
         if (!string.IsNullOrEmpty(CharacterBlacklist))
         {
             _logger.LogInformation($"Character blacklist: '{CharacterBlacklist}'");
+        }
+
+        if (ShortThreshold > 0 && ExtendTo > 0)
+        {
+            _logger.LogInformation($"Short subtitle extension: subtitles < {ShortThreshold}ms will be extended to {ExtendTo}ms");
         }
 
         var initException = TesseractApi.Initialize(_tesseractVersion, _libLeptName, _libLeptVersion);
@@ -209,20 +215,28 @@ public class PgsOcr
             var startTime = new TimeCode(result.StartTime / 90.0);
             var endTime = new TimeCode(result.EndTime / 90.0);
             
-            // Ensure minimum duration
-            var duration = endTime.TotalMilliseconds - startTime.TotalMilliseconds;
-            if (duration < MinDurationMs)
+            var currentDuration = endTime.TotalMilliseconds - startTime.TotalMilliseconds;
+            var minDuration = CalculateMinimumDuration(result.Text);
+            
+            // Extend very short durations for readability
+            if (currentDuration < minDuration)
             {
-                endTime = new TimeCode(startTime.TotalMilliseconds + MinDurationMs);
+                var newEndTime = startTime.TotalMilliseconds + minDuration;
                 
-                // Don't overlap with next subtitle
+                // Check if extending would overlap with next subtitle
                 if (i + 1 < results.Count)
                 {
-                    var nextStart = new TimeCode(results[i + 1].StartTime / 90.0);
-                    if (endTime.TotalMilliseconds > nextStart.TotalMilliseconds - 100)
+                    var nextStartTime = new TimeCode(results[i + 1].StartTime / 90.0).TotalMilliseconds;
+                    if (newEndTime > nextStartTime - 100)
                     {
-                        endTime = new TimeCode(nextStart.TotalMilliseconds - 100);
+                        newEndTime = Math.Max(nextStartTime - 100, startTime.TotalMilliseconds + 500);
                     }
+                }
+                
+                if (newEndTime > startTime.TotalMilliseconds)
+                {
+                    endTime = new TimeCode(newEndTime);
+                    _logger.LogDebug($"Extended subtitle {i + 1} from {currentDuration}ms to {endTime.TotalMilliseconds - startTime.TotalMilliseconds}ms for readability");
                 }
             }
             
@@ -236,6 +250,23 @@ public class PgsOcr
         }
         
         return paragraphs;
+    }
+
+    private int CalculateMinimumDuration(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return 1000;
+
+        var wordCount = text.Split(new[] { ' ', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries).Length;
+        var calculatedTime = Math.Max(wordCount * 250 + 500, 1000);
+        
+        if (ShortThreshold > 0)
+            calculatedTime = Math.Max(calculatedTime, ShortThreshold);
+            
+        if (ExtendTo > 0)
+            calculatedTime = Math.Max(calculatedTime, ExtendTo);
+            
+        return calculatedTime;
     }
 
     private string ExtractText(Engine engine, BluRaySupParserImageSharp.PcsData item)
