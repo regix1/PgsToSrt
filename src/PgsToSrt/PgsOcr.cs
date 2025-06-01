@@ -156,7 +156,7 @@ public class PgsOcr
             
             // Look ahead for entries that contain any of our lines
             var j = i + 1;
-            while (j < results.Count)
+            while (j < results.Count && currentLines.Count < 3) // Limit to 3 lines max
             {
                 var next = results[j];
                 var nextLines = next.Text.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
@@ -169,19 +169,29 @@ public class PgsOcr
                 
                 if (hasOverlap)
                 {
-                    // Extend time range
-                    endTime = Math.Max(endTime, next.EndTime);
-                    
-                    // Add any new lines from next that aren't in current
-                    foreach (var line in nextLines)
+                    // Only merge if we won't exceed 3 lines
+                    var newLinesCount = nextLines.Count(line => !currentLines.Contains(line, StringComparer.OrdinalIgnoreCase));
+                    if (currentLines.Count + newLinesCount <= 3)
                     {
-                        if (!currentLines.Contains(line, StringComparer.OrdinalIgnoreCase))
+                        // Extend time range
+                        endTime = Math.Max(endTime, next.EndTime);
+                        
+                        // Add any new lines from next that aren't in current
+                        foreach (var line in nextLines)
                         {
-                            currentLines.Add(line);
+                            if (!currentLines.Contains(line, StringComparer.OrdinalIgnoreCase))
+                            {
+                                currentLines.Add(line);
+                            }
                         }
+                        
+                        j++;
                     }
-                    
-                    j++;
+                    else
+                    {
+                        // Would exceed line limit, stop merging
+                        break;
+                    }
                 }
                 else
                 {
@@ -193,7 +203,7 @@ public class PgsOcr
             merged.Add(new OcrResult
             {
                 Index = current.Index,
-                Text = string.Join("\n", currentLines),
+                Text = string.Join("\n", currentLines.Take(3)), // Ensure max 3 lines
                 StartTime = startTime,
                 EndTime = endTime
             });
