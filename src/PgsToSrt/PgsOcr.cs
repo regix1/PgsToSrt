@@ -182,18 +182,41 @@ public class PgsOcr
             allLines.AddRange(lines);
         }
 
-        // Remove exact duplicates only
+        // Remove duplicates (including near-duplicates)
         var uniqueLines = new List<string>();
         foreach (var line in allLines)
         {
-            if (!uniqueLines.Any(existing => 
-                string.Equals(existing, line, StringComparison.OrdinalIgnoreCase)))
+            if (!IsLineDuplicate(line, uniqueLines))
             {
                 uniqueLines.Add(line);
             }
         }
 
         return string.Join("\n", uniqueLines);
+    }
+
+    private static bool IsLineDuplicate(string newLine, List<string> existingLines)
+    {
+        foreach (var existing in existingLines)
+        {
+            // Exact match
+            if (string.Equals(existing, newLine, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // Clean both lines and compare (removes spaces, dots for number sequences)
+            var cleanExisting = CleanForComparison(existing);
+            var cleanNew = CleanForComparison(newLine);
+            
+            if (string.Equals(cleanExisting, cleanNew, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private static string CleanForComparison(string text)
+    {
+        // Remove spaces and periods for comparison (catches "0.7.0.5" vs "0.7. 0.5")
+        return text.Replace(" ", "").Replace(".", "").Replace(",", "");
     }
 
     private Image<Rgba32> GetBitmap(BluRaySupParserImageSharp.PcsData subtitle)
@@ -310,10 +333,13 @@ public class PgsOcr
             
             var currentDuration = endTime.TotalMilliseconds - startTime.TotalMilliseconds;
             
-            // Extend short subtitles if configured
-            if (ShortThreshold > 0 && ExtendTo > 0 && currentDuration < ShortThreshold)
+            // Calculate needed duration based on content
+            var neededDuration = CalculateNeededDuration(result.Text);
+            
+            // Extend if current duration is too short
+            if (currentDuration < neededDuration)
             {
-                var newEndTime = startTime.TotalMilliseconds + ExtendTo;
+                var newEndTime = startTime.TotalMilliseconds + neededDuration;
                 
                 // Check if extending would overlap with next subtitle
                 if (i + 1 < results.Count)
@@ -328,7 +354,7 @@ public class PgsOcr
                 if (newEndTime > startTime.TotalMilliseconds)
                 {
                     endTime = new TimeCode(newEndTime);
-                    _logger.LogDebug($"Extended short subtitle {i + 1} from {currentDuration}ms to {endTime.TotalMilliseconds - startTime.TotalMilliseconds}ms");
+                    _logger.LogDebug($"Extended subtitle {i + 1} from {currentDuration}ms to {endTime.TotalMilliseconds - startTime.TotalMilliseconds}ms for readability");
                 }
             }
             
@@ -342,6 +368,30 @@ public class PgsOcr
         }
         
         return paragraphs;
+    }
+
+    private int CalculateNeededDuration(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return ShortThreshold > 0 ? ShortThreshold : 1200;
+
+        // Count lines and characters
+        var lines = text.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+        var charCount = text.Length;
+        
+        // Reading time calculation:
+        // - Base time per line: 1500ms (1.5 seconds)
+        // - Additional time per character: 50ms
+        var lineTime = lines.Length * 1500;
+        var charTime = charCount * 50;
+        var calculatedTime = lineTime + charTime;
+        
+        // Apply configured minimums
+        var configuredMin = ShortThreshold > 0 ? ShortThreshold : 1200;
+        var configuredExtend = ExtendTo > 0 ? ExtendTo : 2000;
+        
+        // Use the maximum of all calculations
+        return Math.Max(calculatedTime, Math.Max(configuredMin, configuredExtend));
     }
 
     private List<Paragraph> RemoveDuplicates(List<Paragraph> paragraphs)
@@ -415,6 +465,13 @@ public class PgsOcr
 
         // Exact match
         if (normalized1.Equals(normalized2, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Clean both and compare (catches spacing/punctuation differences)
+        var clean1 = CleanForComparison(normalized1);
+        var clean2 = CleanForComparison(normalized2);
+        
+        if (clean1.Equals(clean2, StringComparison.OrdinalIgnoreCase))
             return true;
 
         // One contains the other (for partial duplicates)
