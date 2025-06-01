@@ -19,10 +19,12 @@ namespace PgsToSrt;
 
 public class PgsOcr
 {
-    private readonly Microsoft.Extensions.Logging.ILogger _logger;
+    private readonly ILogger _logger;
     private readonly string _tesseractVersion;
     private readonly string _libLeptName;
     private readonly string _libLeptVersion;
+    
+    private const int ProximityThresholdMilliseconds = 500;
 
     public string TesseractDataPath { get; set; }
     public string TesseractLanguage { get; set; } = "eng";
@@ -30,7 +32,7 @@ public class PgsOcr
     public int ShortThreshold { get; set; } = 300;
     public int ExtendTo { get; set; } = 1200;
 
-    public PgsOcr(Microsoft.Extensions.Logging.ILogger logger, string tesseractVersion, string libLeptName, string libLeptVersion)
+    public PgsOcr(ILogger logger, string tesseractVersion, string libLeptName, string libLeptVersion)
     {
         _logger = logger;
         _tesseractVersion = tesseractVersion;
@@ -125,8 +127,11 @@ public class PgsOcr
 
         var sortedResults = ocrResults.OrderBy(r => r.Index).ToList();
         
-        // Group overlapping subtitles to combine simultaneous dialogue
-        var groupedResults = GroupOverlappingSubtitles(sortedResults);
+        // Analyze duplicate patterns across all subtitles
+        var duplicatePatterns = AnalyzeDuplicatePatterns(sortedResults);
+        
+        // Group overlapping subtitles using duplicate pattern information
+        var groupedResults = GroupOverlappingSubtitles(sortedResults, duplicatePatterns);
         
         // Convert to paragraphs with duration extension
         var paragraphs = ConvertToParagraphs(groupedResults);
@@ -200,7 +205,42 @@ public class PgsOcr
         }
     }
 
-    private List<OcrResult> GroupOverlappingSubtitles(List<OcrResult> results)
+    private Dictionary<string, List<OcrResult>> AnalyzeDuplicatePatterns(List<OcrResult> results)
+    {
+        var textOccurrences = new Dictionary<string, List<OcrResult>>(StringComparer.OrdinalIgnoreCase);
+        
+        foreach (var result in results)
+        {
+            if (string.IsNullOrWhiteSpace(result.Text)) continue;
+            
+            var lines = result.Text.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                                  .Select(l => l.Trim())
+                                  .Where(l => !string.IsNullOrEmpty(l));
+            
+            foreach (var line in lines)
+            {
+                var normalizedLine = NormalizeText(line);
+                
+                if (!textOccurrences.ContainsKey(normalizedLine))
+                {
+                    textOccurrences[normalizedLine] = new List<OcrResult>();
+                }
+                
+                textOccurrences[normalizedLine].Add(result);
+            }
+        }
+        
+        // Only keep text that appears multiple times (duplicates)
+        var duplicatePatterns = textOccurrences
+            .Where(kvp => kvp.Value.Count > 1)
+            .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+        
+        _logger.LogInformation($"Found {duplicatePatterns.Count} duplicate text patterns across subtitles");
+        
+        return duplicatePatterns;
+    }
+
+    private List<OcrResult> GroupOverlappingSubtitles(List<OcrResult> results, Dictionary<string, List<OcrResult>> duplicatePatterns)
     {
         if (results.Count <= 1) return results;
 
@@ -215,48 +255,49 @@ public class PgsOcr
             var overlappingGroup = new List<OcrResult> { current };
             processed.Add(i);
 
-            var currentStartMs = current.StartTime / 90.0;
-            var currentEndMs = current.EndTime / 90.0;
+            // Convert times to milliseconds for easier comparison
+            var currentGroupStartTimeMs = current.StartTime / 90.0;
+            var currentGroupEndTimeMs = current.EndTime / 90.0;
 
-            // Find all subtitles that overlap with current subtitle's time range
             for (int j = i + 1; j < results.Count; j++)
             {
                 if (processed.Contains(j)) continue;
 
                 var other = results[j];
-                var otherStartMs = other.StartTime / 90.0;
-                var otherEndMs = other.EndTime / 90.0;
+                var otherStartTimeMs = other.StartTime / 90.0;
+                var otherEndTimeMs = other.EndTime / 90.0;
 
-                // Check for time overlap
-                bool overlaps = (otherStartMs < currentEndMs) && (otherEndMs > currentStartMs);
+                // Condition 1: Strict overlap
+                bool strictlyOverlaps = (otherStartTimeMs < currentGroupEndTimeMs) && (otherEndTimeMs > currentGroupStartTimeMs);
+                
+                // Condition 2: Proximity (other starts shortly after current group ends)
+                bool isProximate = (otherStartTimeMs >= currentGroupEndTimeMs) && 
+                                   (otherStartTimeMs < (currentGroupEndTimeMs + ProximityThresholdMilliseconds));
 
-                if (overlaps)
+                if (strictlyOverlaps || isProximate)
                 {
                     overlappingGroup.Add(other);
                     processed.Add(j);
                     
-                    // Expand time range to include this subtitle
-                    currentStartMs = Math.Min(currentStartMs, otherStartMs);
-                    currentEndMs = Math.Max(currentEndMs, otherEndMs);
+                    // Expand the current group's time window to include the 'other' subtitle
+                    currentGroupStartTimeMs = Math.Min(currentGroupStartTimeMs, otherStartTimeMs);
+                    currentGroupEndTimeMs = Math.Max(currentGroupEndTimeMs, otherEndTimeMs);
                 }
             }
 
-            // Combine overlapping subtitles
             if (overlappingGroup.Count > 1)
             {
-                var combinedText = CombineOverlappingTexts(overlappingGroup);
-                var earliestStart = (long)(currentStartMs * 90.0);
-                var latestEnd = (long)(currentEndMs * 90.0);
-
+                // Pass duplicatePatterns to CombineOverlappingTexts
+                var combinedText = CombineOverlappingTexts(overlappingGroup, duplicatePatterns);
+                
                 grouped.Add(new OcrResult
                 {
-                    Index = current.Index,
+                    Index = overlappingGroup.Min(r => r.Index), // Take the earliest index
                     Text = combinedText,
-                    StartTime = earliestStart,
-                    EndTime = latestEnd
+                    StartTime = (long)(currentGroupStartTimeMs * 90.0),
+                    EndTime = (long)(currentGroupEndTimeMs * 90.0)
                 });
-
-                _logger.LogDebug($"Combined {overlappingGroup.Count} overlapping subtitles into one");
+                _logger.LogDebug($"Combined {overlappingGroup.Count} subtitles (Indices: {string.Join(", ", overlappingGroup.Select(r=>r.Index))}) into one.");
             }
             else
             {
@@ -264,48 +305,50 @@ public class PgsOcr
             }
         }
 
-        _logger.LogInformation($"Grouped {results.Count} subtitles into {grouped.Count} (combined {results.Count - grouped.Count} overlapping)");
+        _logger.LogInformation($"Grouped {results.Count} subtitles into {grouped.Count} (combined {results.Count - grouped.Count} based on overlap/proximity)");
         return grouped;
     }
 
-    private string CombineOverlappingTexts(List<OcrResult> overlappingSubtitles)
+    private string CombineOverlappingTexts(List<OcrResult> overlappingSubtitles, Dictionary<string, List<OcrResult>> duplicatePatterns)
     {
-        var uniqueLines = new List<string>();
-        
-        foreach (var subtitle in overlappingSubtitles)
+        // Use a HashSet to store unique lines from this group to avoid redundant processing
+        var uniqueLinesInThisGroup = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var orderedLinesForOutput = new List<string>();
+
+        // Order subtitles in the group by their start time to preserve sensible reading order
+        foreach (var subtitle in overlappingSubtitles.OrderBy(s => s.StartTime))
         {
             if (string.IsNullOrWhiteSpace(subtitle.Text)) continue;
-            
+
             var lines = subtitle.Text.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
-                                   .Select(l => l.Trim())
-                                   .Where(l => !string.IsNullOrEmpty(l));
+                                  .Select(l => l.Trim())
+                                  .Where(l => !string.IsNullOrEmpty(l));
             
             foreach (var line in lines)
             {
-                if (!IsLineDuplicate(line, uniqueLines))
+                if (uniqueLinesInThisGroup.Add(line)) // .Add returns true if the item was new
                 {
-                    uniqueLines.Add(line);
+                    orderedLinesForOutput.Add(line);
                 }
             }
         }
         
-        return string.Join("\n", uniqueLines);
-    }
-
-    private static bool IsLineDuplicate(string newLine, List<string> existingLines)
-    {
-        foreach (var existing in existingLines)
+        var resultBuilder = new StringBuilder();
+        foreach (var line in orderedLinesForOutput)
         {
-            if (string.Equals(existing, newLine, StringComparison.OrdinalIgnoreCase))
-                return true;
+            // Use the same normalization for lookup as used when populating duplicatePatterns
+            var normalizedLine = NormalizeText(line); 
 
-            var normalizedExisting = NormalizeText(existing);
-            var normalizedNew = NormalizeText(newLine);
-            
-            if (string.Equals(normalizedExisting, normalizedNew, StringComparison.OrdinalIgnoreCase))
-                return true;
+            if (duplicatePatterns.ContainsKey(normalizedLine))
+            {
+                resultBuilder.AppendLine($"<i>{line}</i>"); // Italicize the original line
+            }
+            else
+            {
+                resultBuilder.AppendLine(line);
+            }
         }
-        return false;
+        return resultBuilder.ToString().TrimEnd('\r', '\n'); // Trim trailing newlines
     }
 
     private List<Paragraph> ConvertToParagraphs(List<OcrResult> results)
@@ -382,7 +425,8 @@ public class PgsOcr
 
         foreach (var paragraph in paragraphs)
         {
-            var normalizedText = NormalizeText(paragraph.Text);
+            // Remove formatting tags for comparison but keep original text
+            var normalizedText = NormalizeText(paragraph.Text.Replace("<i>", "").Replace("</i>", ""));
             
             if (!seenTexts.Contains(normalizedText))
             {
