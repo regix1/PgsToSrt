@@ -19,7 +19,7 @@ namespace PgsToSrt;
 
 public class PgsOcr
 {
-    private readonly ILogger _logger;
+    private readonly Microsoft.Extensions.Logging.ILogger _logger;
     private readonly string _tesseractVersion;
     private readonly string _libLeptName;
     private readonly string _libLeptVersion;
@@ -32,7 +32,7 @@ public class PgsOcr
     public int ShortThreshold { get; set; } = 300;
     public int ExtendTo { get; set; } = 1200;
 
-    public PgsOcr(ILogger logger, string tesseractVersion, string libLeptName, string libLeptVersion)
+    public PgsOcr(Microsoft.Extensions.Logging.ILogger logger, string tesseractVersion, string libLeptName, string libLeptVersion)
     {
         _logger = logger;
         _tesseractVersion = tesseractVersion;
