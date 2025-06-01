@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
@@ -122,12 +123,14 @@ public class PgsOcr
 
         var sortedResults = results.OrderBy(r => r.Index).ToList();
         
-        // Merge overlapping subtitles before converting to paragraphs
+        // Merge overlapping subtitles with improved logic
         var mergedResults = MergeOverlappingSubtitles(sortedResults);
         var paragraphs = ConvertToParagraphs(mergedResults);
         
         return RemoveDuplicates(paragraphs);
     }
+
+
 
     private List<OcrResult> MergeOverlappingSubtitles(List<OcrResult> results)
     {
@@ -141,32 +144,36 @@ public class PgsOcr
             var current = results[i];
             var overlapping = new List<OcrResult> { current };
 
-            // Look for overlapping subtitles within a small time window (500ms)
+            // Look for overlapping or closely adjacent subtitles
             for (int j = i + 1; j < results.Count; j++)
             {
                 var next = results[j];
-                var timeDiff = Math.Abs((next.StartTime / 90.0) - (current.StartTime / 90.0));
                 
-                if (timeDiff <= 500) // 500ms window
+                var currentEndMs = current.EndTime / 90.0;
+                var nextStartMs = next.StartTime / 90.0;
+                var gap = nextStartMs - currentEndMs;
+                
+                // Only merge if gap is very small (≤ 500ms) AND texts are compatible
+                if (gap <= 500 && ShouldMergeTexts(current.Text, next.Text))
                 {
                     overlapping.Add(next);
+                    current = next; // Update current to the latest for next iteration
                 }
                 else
                 {
-                    break; // No more overlapping subtitles
+                    break; // Gap too large or incompatible texts
                 }
             }
 
             if (overlapping.Count > 1)
             {
-                // Merge multiple overlapping subtitles
-                var combinedText = string.Join("\n", overlapping.Select(o => o.Text).Distinct());
+                var combinedText = SmartCombineTexts(overlapping.Select(o => o.Text).ToList());
                 var earliestStart = overlapping.Min(o => o.StartTime);
                 var latestEnd = overlapping.Max(o => o.EndTime);
 
                 merged.Add(new OcrResult
                 {
-                    Index = current.Index,
+                    Index = overlapping[0].Index,
                     Text = combinedText,
                     StartTime = earliestStart,
                     EndTime = latestEnd
@@ -182,6 +189,92 @@ public class PgsOcr
         }
 
         return merged;
+    }
+
+    private bool ShouldMergeTexts(string text1, string text2)
+    {
+        // Don't merge if either text has multiple complete sentences
+        if (HasMultipleSentences(text1) || HasMultipleSentences(text2))
+            return false;
+        
+        // Don't merge if texts seem to be from different speakers/contexts
+        if (HasSpeakerIndicators(text1) || HasSpeakerIndicators(text2))
+            return false;
+            
+        // Don't merge if one is a label/title and other is dialogue
+        if (IsLabelOrTitle(text1) != IsLabelOrTitle(text2))
+            return false;
+        
+        // Don't merge technical announcements with dialogue
+        if (IsTechnicalAnnouncement(text1) != IsTechnicalAnnouncement(text2))
+            return false;
+            
+        // Don't merge countdowns with other text
+        if (IsCountdown(text1) || IsCountdown(text2))
+            return false;
+        
+        return true;
+    }
+
+    private bool HasMultipleSentences(string text)
+    {
+        var sentences = text.Split(new[] { '.', '!', '?' }, StringSplitOptions.RemoveEmptyEntries)
+                           .Where(s => s.Trim().Length > 3)
+                           .Count();
+        return sentences > 1;
+    }
+
+    private bool HasSpeakerIndicators(string text)
+    {
+        // Look for dialogue indicators
+        return text.Contains(" - ") || text.StartsWith("- ") || 
+               text.Contains(": ") || text.Contains("\"");
+    }
+
+    private bool IsLabelOrTitle(string text)
+    {
+        // Detect titles, location markers, time stamps
+        return text.All(char.IsUpper) || 
+               text.Contains("NERV") || 
+               text.Contains("Episode") ||
+               Regex.IsMatch(text, @"^\d+\s+(Days?|Minutes?|Hours?)\s+(Ago|Later)", RegexOptions.IgnoreCase);
+    }
+
+    private bool IsTechnicalAnnouncement(string text)
+    {
+        var technicalTerms = new[] { "LCL", "Unit", "circuits", "power", "activation", "neural", "pulse", "sync" };
+        return technicalTerms.Any(term => text.Contains(term, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private bool IsCountdown(string text)
+    {
+        return Regex.IsMatch(text, @"\b\d+\.?\s*(seconds?|minutes?)|\b\d+\.\d+\b|\b[0-9]+\s*\.\s*[0-9]+");
+    }
+
+    private string SmartCombineTexts(List<string> texts)
+    {
+        var allLines = new List<string>();
+        
+        foreach (var text in texts)
+        {
+            var lines = text.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                            .Select(l => l.Trim())
+                            .Where(l => !string.IsNullOrEmpty(l));
+            allLines.AddRange(lines);
+        }
+
+        // Remove exact duplicates while preserving order
+        var uniqueLines = new List<string>();
+        foreach (var line in allLines)
+        {
+            if (!uniqueLines.Any(existing => 
+                string.Equals(existing.Trim(), line.Trim(), StringComparison.OrdinalIgnoreCase)))
+            {
+                uniqueLines.Add(line);
+            }
+        }
+        
+        return string.Join("\n", uniqueLines);
     }
 
     private string ExtractText(BluRaySupParserImageSharp.PcsData subtitle)
@@ -547,7 +640,7 @@ public class PgsOcr
 
     private static string NormalizeText(string text)
     {
-        return System.Text.RegularExpressions.Regex.Replace(text.Trim(), @"\s+", " ");
+        return Regex.Replace(text.Trim(), @"\s+", " ");
     }
 
     private static Subtitle CreateSubtitle(List<Paragraph> paragraphs)
