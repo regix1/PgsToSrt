@@ -121,9 +121,67 @@ public class PgsOcr
         _logger.LogInformation($"OCR completed. Found {results.Count} valid subtitles from {subtitles.Count} processed");
 
         var sortedResults = results.OrderBy(r => r.Index).ToList();
-        var paragraphs = ConvertToParagraphs(sortedResults);
+        
+        // Merge overlapping subtitles before converting to paragraphs
+        var mergedResults = MergeOverlappingSubtitles(sortedResults);
+        var paragraphs = ConvertToParagraphs(mergedResults);
         
         return RemoveDuplicates(paragraphs);
+    }
+
+    private List<OcrResult> MergeOverlappingSubtitles(List<OcrResult> results)
+    {
+        if (results.Count <= 1) return results;
+
+        var merged = new List<OcrResult>();
+        var i = 0;
+
+        while (i < results.Count)
+        {
+            var current = results[i];
+            var overlapping = new List<OcrResult> { current };
+
+            // Look for overlapping subtitles within a small time window (500ms)
+            for (int j = i + 1; j < results.Count; j++)
+            {
+                var next = results[j];
+                var timeDiff = Math.Abs((next.StartTime / 90.0) - (current.StartTime / 90.0));
+                
+                if (timeDiff <= 500) // 500ms window
+                {
+                    overlapping.Add(next);
+                }
+                else
+                {
+                    break; // No more overlapping subtitles
+                }
+            }
+
+            if (overlapping.Count > 1)
+            {
+                // Merge multiple overlapping subtitles
+                var combinedText = string.Join("\n", overlapping.Select(o => o.Text).Distinct());
+                var earliestStart = overlapping.Min(o => o.StartTime);
+                var latestEnd = overlapping.Max(o => o.EndTime);
+
+                merged.Add(new OcrResult
+                {
+                    Index = current.Index,
+                    Text = combinedText,
+                    StartTime = earliestStart,
+                    EndTime = latestEnd
+                });
+
+                i += overlapping.Count; // Skip all merged items
+            }
+            else
+            {
+                merged.Add(current);
+                i++;
+            }
+        }
+
+        return merged;
     }
 
     private string ExtractText(BluRaySupParserImageSharp.PcsData subtitle)
