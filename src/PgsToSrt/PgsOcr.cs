@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
@@ -13,7 +12,6 @@ using Nikse.SubtitleEdit.Core.SubtitleFormats;
 using PgsToSrt.BluRaySup;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
 using TesseractOCR;
 using TesseractOCR.Enums;
 
@@ -87,23 +85,28 @@ public class PgsOcr
 
     private List<Paragraph> ProcessSubtitles(List<BluRaySupParserImageSharp.PcsData> subtitles)
     {
-        var results = new ConcurrentBag<OcrResult>();
+        var ocrResults = new ConcurrentBag<OcrResult>();
         var processedCount = 0;
 
-        Parallel.ForEach(subtitles, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, 
-            (subtitle, loop, index) =>
+        // Process subtitles in parallel using original simple approach
+        Parallel.ForEach(Enumerable.Range(0, subtitles.Count), i =>
         {
             try
             {
-                var text = ExtractText(subtitle);
+                using var engine = new Engine(TesseractDataPath, TesseractLanguage);
+                ConfigureEngine(engine);
+                
+                var item = subtitles[i];
+                var text = GetText(engine, item);
+                
                 if (!string.IsNullOrWhiteSpace(text))
                 {
-                    results.Add(new OcrResult
+                    ocrResults.Add(new OcrResult
                     {
-                        Index = (int)index,
+                        Index = i,
                         Text = text,
-                        StartTime = subtitle.StartTime,
-                        EndTime = subtitle.EndTime
+                        StartTime = item.StartTime,
+                        EndTime = item.EndTime
                     });
                 }
 
@@ -115,289 +118,38 @@ public class PgsOcr
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, $"Failed to process subtitle {index}: {ex.Message}");
+                _logger.LogWarning(ex, $"Failed to process subtitle {i}: {ex.Message}");
             }
         });
 
-        _logger.LogInformation($"OCR completed. Found {results.Count} valid subtitles from {subtitles.Count} processed");
+        _logger.LogInformation($"OCR completed. Found {ocrResults.Count} valid subtitles from {subtitles.Count} processed");
 
-        var sortedResults = results.OrderBy(r => r.Index).ToList();
+        var sortedResults = ocrResults.OrderBy(r => r.Index).ToList();
         
-        // Merge overlapping subtitles with improved logic
-        var mergedResults = MergeOverlappingSubtitles(sortedResults);
-        var paragraphs = ConvertToParagraphs(mergedResults);
+        // Convert to paragraphs with duration extension
+        var paragraphs = ConvertToParagraphs(sortedResults);
         
         return RemoveDuplicates(paragraphs);
     }
 
-
-
-    private List<OcrResult> MergeOverlappingSubtitles(List<OcrResult> results)
-    {
-        if (results.Count <= 1) return results;
-
-        var merged = new List<OcrResult>();
-        var i = 0;
-
-        while (i < results.Count)
-        {
-            var current = results[i];
-            var overlapping = new List<OcrResult> { current };
-
-            // Look for overlapping or closely adjacent subtitles
-            for (int j = i + 1; j < results.Count; j++)
-            {
-                var next = results[j];
-                
-                var currentEndMs = current.EndTime / 90.0;
-                var nextStartMs = next.StartTime / 90.0;
-                var gap = nextStartMs - currentEndMs;
-                
-                // Only merge if gap is very small (≤ 500ms) AND texts are compatible
-                if (gap <= 500 && ShouldMergeTexts(current.Text, next.Text))
-                {
-                    overlapping.Add(next);
-                    current = next; // Update current to the latest for next iteration
-                }
-                else
-                {
-                    break; // Gap too large or incompatible texts
-                }
-            }
-
-            if (overlapping.Count > 1)
-            {
-                var combinedText = SmartCombineTexts(overlapping.Select(o => o.Text).ToList());
-                var earliestStart = overlapping.Min(o => o.StartTime);
-                var latestEnd = overlapping.Max(o => o.EndTime);
-
-                merged.Add(new OcrResult
-                {
-                    Index = overlapping[0].Index,
-                    Text = combinedText,
-                    StartTime = earliestStart,
-                    EndTime = latestEnd
-                });
-
-                i += overlapping.Count; // Skip all merged items
-            }
-            else
-            {
-                merged.Add(current);
-                i++;
-            }
-        }
-
-        return merged;
-    }
-
-    private bool ShouldMergeTexts(string text1, string text2)
-    {
-        // Don't merge if either text has multiple complete sentences
-        if (HasMultipleSentences(text1) || HasMultipleSentences(text2))
-            return false;
-        
-        // Don't merge if texts seem to be from different speakers/contexts
-        if (HasSpeakerIndicators(text1) || HasSpeakerIndicators(text2))
-            return false;
-            
-        // Don't merge if one is a label/title and other is dialogue
-        if (IsLabelOrTitle(text1) != IsLabelOrTitle(text2))
-            return false;
-        
-        // Don't merge technical announcements with dialogue
-        if (IsTechnicalAnnouncement(text1) != IsTechnicalAnnouncement(text2))
-            return false;
-            
-        // Don't merge countdowns with other text
-        if (IsCountdown(text1) || IsCountdown(text2))
-            return false;
-        
-        return true;
-    }
-
-    private bool HasMultipleSentences(string text)
-    {
-        var sentences = text.Split(new[] { '.', '!', '?' }, StringSplitOptions.RemoveEmptyEntries)
-                           .Where(s => s.Trim().Length > 3)
-                           .Count();
-        return sentences > 1;
-    }
-
-    private bool HasSpeakerIndicators(string text)
-    {
-        // Look for dialogue indicators
-        return text.Contains(" - ") || text.StartsWith("- ") || 
-               text.Contains(": ") || text.Contains("\"");
-    }
-
-    private bool IsLabelOrTitle(string text)
-    {
-        // Detect titles, location markers, time stamps
-        return text.All(char.IsUpper) || 
-               text.Contains("NERV") || 
-               text.Contains("Episode") ||
-               Regex.IsMatch(text, @"^\d+\s+(Days?|Minutes?|Hours?)\s+(Ago|Later)", RegexOptions.IgnoreCase);
-    }
-
-    private bool IsTechnicalAnnouncement(string text)
-    {
-        var technicalTerms = new[] { "LCL", "Unit", "circuits", "power", "activation", "neural", "pulse", "sync" };
-        return technicalTerms.Any(term => text.Contains(term, StringComparison.OrdinalIgnoreCase));
-    }
-
-    private bool IsCountdown(string text)
-    {
-        return Regex.IsMatch(text, @"\b\d+\.?\s*(seconds?|minutes?)|\b\d+\.\d+\b|\b[0-9]+\s*\.\s*[0-9]+");
-    }
-
-    private string SmartCombineTexts(List<string> texts)
-    {
-        var allLines = new List<string>();
-        
-        foreach (var text in texts)
-        {
-            var lines = text.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
-                            .Select(l => l.Trim())
-                            .Where(l => !string.IsNullOrEmpty(l));
-            allLines.AddRange(lines);
-        }
-
-        // Remove exact duplicates while preserving order
-        var uniqueLines = new List<string>();
-        foreach (var line in allLines)
-        {
-            if (!uniqueLines.Any(existing => 
-                string.Equals(existing.Trim(), line.Trim(), StringComparison.OrdinalIgnoreCase)))
-            {
-                uniqueLines.Add(line);
-            }
-        }
-        
-        return string.Join("\n", uniqueLines);
-    }
-
-    private string ExtractText(BluRaySupParserImageSharp.PcsData subtitle)
-    {
-        using var bitmap = GetBitmap(subtitle);
-        if (bitmap == null || bitmap.Width == 0 || bitmap.Height == 0)
-        {
-            return string.Empty;
-        }
-
-        // Try multiple OCR approaches for better multi-region text detection
-        var results = new List<string>();
-
-        // Method 1: Try SparseText first for multi-speaker scenarios
-        var sparseResult = PerformOcr(bitmap, PageSegMode.SparseText);
-        if (!string.IsNullOrWhiteSpace(sparseResult))
-        {
-            results.Add(sparseResult);
-        }
-
-        // Method 2: Try basic OCR 
-        var basicResult = PerformOcr(bitmap, PageSegMode.Auto);
-        if (IsGoodResult(basicResult))
-        {
-            results.Add(basicResult);
-        }
-
-        // Method 3: Try with enhanced preprocessing if needed
-        if (results.Count == 0 || !IsGoodResult(results[0]))
-        {
-            using var processed = EnhanceImage(bitmap);
-            var processedResult = PerformOcr(processed, PageSegMode.SingleBlock);
-            if (!string.IsNullOrWhiteSpace(processedResult))
-            {
-                results.Add(processedResult);
-            }
-        }
-
-        // Combine results to capture multiple speakers
-        return CombineResults(results);
-    }
-
-    private string CombineResults(List<string> results)
-    {
-        if (results.Count == 0) return string.Empty;
-        if (results.Count == 1) return results[0];
-
-        // Split each result into lines and combine unique ones
-        var allLines = new List<string>();
-        foreach (var result in results)
-        {
-            var lines = result.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
-                             .Select(l => l.Trim())
-                             .Where(l => !string.IsNullOrEmpty(l))
-                             .ToList();
-            allLines.AddRange(lines);
-        }
-
-        // Remove duplicates (including near-duplicates)
-        var uniqueLines = new List<string>();
-        foreach (var line in allLines)
-        {
-            if (!IsLineDuplicate(line, uniqueLines))
-            {
-                uniqueLines.Add(line);
-            }
-        }
-
-        return string.Join("\n", uniqueLines);
-    }
-
-    private static bool IsLineDuplicate(string newLine, List<string> existingLines)
-    {
-        foreach (var existing in existingLines)
-        {
-            // Exact match
-            if (string.Equals(existing, newLine, StringComparison.OrdinalIgnoreCase))
-                return true;
-
-            // Clean both lines and compare (removes spaces, dots for number sequences)
-            var cleanExisting = CleanForComparison(existing);
-            var cleanNew = CleanForComparison(newLine);
-            
-            if (string.Equals(cleanExisting, cleanNew, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-        return false;
-    }
-
-    private static string CleanForComparison(string text)
-    {
-        // Remove spaces and periods for comparison (catches "0.7.0.5" vs "0.7. 0.5")
-        return text.Replace(" ", "").Replace(".", "").Replace(",", "");
-    }
-
-    private Image<Rgba32> GetBitmap(BluRaySupParserImageSharp.PcsData subtitle)
+    private string GetText(Engine engine, BluRaySupParserImageSharp.PcsData item)
     {
         try
         {
-            return subtitle.GetRgba32();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to get bitmap from subtitle");
-            return null;
-        }
-    }
+            using var bitmap = GetSubtitleBitmap(item);
+            if (bitmap == null || bitmap.Width == 0 || bitmap.Height == 0)
+            {
+                return string.Empty;
+            }
 
-    private string PerformOcr(Image<Rgba32> image, PageSegMode pageSegMode)
-    {
-        try
-        {
-            using var engine = new Engine(TesseractDataPath, TesseractLanguage);
-            ConfigureEngine(engine);
-            
-            using var pixImage = ConvertToPix(image);
-            using var page = engine.Process(pixImage, pageSegMode);
+            using var image = GetPix(bitmap);
+            using var page = engine.Process(image, PageSegMode.Auto);
             
             return page.Text?.Trim() ?? string.Empty;
         }
         catch (Exception ex)
         {
-            _logger.LogDebug($"OCR failed with {pageSegMode}: {ex.Message}");
+            _logger.LogDebug($"OCR failed: {ex.Message}");
             return string.Empty;
         }
     }
@@ -432,44 +184,24 @@ public class PgsOcr
         }
     }
 
-    private static TesseractOCR.Pix.Image ConvertToPix(Image<Rgba32> image)
+    private static TesseractOCR.Pix.Image GetPix(Image<Rgba32> bitmap)
     {
         using var stream = new MemoryStream();
-        image.SaveAsBmp(stream);
+        bitmap.SaveAsBmp(stream);
         return TesseractOCR.Pix.Image.LoadFromMemory(stream.ToArray());
     }
 
-    private static Image<Rgba32> EnhanceImage(Image<Rgba32> original)
+    private Image<Rgba32> GetSubtitleBitmap(BluRaySupParserImageSharp.PcsData item)
     {
-        var enhanced = original.Clone();
-        
         try
         {
-            enhanced.Mutate(x => x
-                .Grayscale()
-                .Resize(original.Width * 2, original.Height * 2, KnownResamplers.Lanczos3)
-                .GaussianSharpen(0.8f)
-                .Contrast(1.1f));
-            
-            return enhanced;
+            return item.GetRgba32();
         }
-        catch
+        catch (Exception ex)
         {
-            enhanced?.Dispose();
-            return original.Clone();
+            _logger.LogWarning(ex, "Failed to get bitmap from subtitle");
+            return null;
         }
-    }
-
-    private static bool IsGoodResult(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-            return false;
-
-        // Consider it good if it's reasonably long and has mostly valid characters
-        var letterCount = text.Count(char.IsLetter);
-        var totalCount = text.Length;
-        
-        return text.Length >= 3 && (double)letterCount / totalCount >= 0.5;
     }
 
     private List<Paragraph> ConvertToParagraphs(List<OcrResult> results)
@@ -484,21 +216,20 @@ public class PgsOcr
             
             var currentDuration = endTime.TotalMilliseconds - startTime.TotalMilliseconds;
             
-            // Calculate needed duration based on content
-            var neededDuration = CalculateNeededDuration(result.Text);
+            // Extend very short durations for readability
+            var minDuration = CalculateMinimumDuration(result.Text);
             
-            // Extend if current duration is too short
-            if (currentDuration < neededDuration)
+            if (currentDuration < minDuration)
             {
-                var newEndTime = startTime.TotalMilliseconds + neededDuration;
+                var newEndTime = startTime.TotalMilliseconds + minDuration;
                 
                 // Check if extending would overlap with next subtitle
                 if (i + 1 < results.Count)
                 {
                     var nextStartTime = new TimeCode(results[i + 1].StartTime / 90.0).TotalMilliseconds;
-                    if (newEndTime > nextStartTime - 200) // Leave 200ms gap
+                    if (newEndTime > nextStartTime - 100) // Leave 100ms gap minimum
                     {
-                        newEndTime = nextStartTime - 200;
+                        newEndTime = Math.Max(nextStartTime - 100, startTime.TotalMilliseconds + 500); // At least 500ms
                     }
                 }
                 
@@ -521,28 +252,23 @@ public class PgsOcr
         return paragraphs;
     }
 
-    private int CalculateNeededDuration(string text)
+    private int CalculateMinimumDuration(string text)
     {
         if (string.IsNullOrWhiteSpace(text))
-            return ShortThreshold > 0 ? ShortThreshold : 1200;
+            return 1000; // 1 second minimum
 
-        // Count lines and characters
-        var lines = text.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-        var charCount = text.Length;
+        // Basic reading time: 250ms per word + 500ms base
+        var wordCount = text.Split(new[] { ' ', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries).Length;
+        var calculatedTime = Math.Max(wordCount * 250 + 500, 1000);
         
-        // Reading time calculation:
-        // - Base time per line: 1500ms (1.5 seconds)
-        // - Additional time per character: 50ms
-        var lineTime = lines.Length * 1500;
-        var charTime = charCount * 50;
-        var calculatedTime = lineTime + charTime;
-        
-        // Apply configured minimums
-        var configuredMin = ShortThreshold > 0 ? ShortThreshold : 1200;
-        var configuredExtend = ExtendTo > 0 ? ExtendTo : 2000;
-        
-        // Use the maximum of all calculations
-        return Math.Max(calculatedTime, Math.Max(configuredMin, configuredExtend));
+        // Apply configured minimums if set
+        if (ShortThreshold > 0)
+            calculatedTime = Math.Max(calculatedTime, ShortThreshold);
+            
+        if (ExtendTo > 0)
+            calculatedTime = Math.Max(calculatedTime, ExtendTo);
+            
+        return calculatedTime;
     }
 
     private List<Paragraph> RemoveDuplicates(List<Paragraph> paragraphs)
@@ -551,51 +277,25 @@ public class PgsOcr
             return paragraphs;
 
         var filtered = new List<Paragraph>();
-        var toSkip = new HashSet<int>();
+        var seenTexts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        for (int i = 0; i < paragraphs.Count; i++)
+        foreach (var paragraph in paragraphs)
         {
-            if (toSkip.Contains(i))
-                continue;
-
-            var current = paragraphs[i];
-            var duplicateFound = false;
-
-            // Look ahead for duplicates within a reasonable time window
-            for (int j = i + 1; j < Math.Min(i + 5, paragraphs.Count); j++)
+            var normalizedText = NormalizeText(paragraph.Text);
+            
+            // Only remove if it's an exact duplicate
+            if (!seenTexts.Contains(normalizedText))
             {
-                if (toSkip.Contains(j))
-                    continue;
-
-                var next = paragraphs[j];
-                
-                // Skip if too far apart in time
-                if (Math.Abs(next.StartTime.TotalMilliseconds - current.StartTime.TotalMilliseconds) > 10000)
-                    break;
-
-                if (AreDuplicates(current.Text, next.Text))
-                {
-                    // Keep the better one
-                    if (current.Text.Length >= next.Text.Length)
-                    {
-                        toSkip.Add(j);
-                    }
-                    else
-                    {
-                        toSkip.Add(i);
-                        duplicateFound = true;
-                        break;
-                    }
-                }
+                seenTexts.Add(normalizedText);
+                filtered.Add(paragraph);
             }
-
-            if (!duplicateFound)
+            else
             {
-                filtered.Add(current);
+                _logger.LogDebug($"Removed exact duplicate: '{paragraph.Text.Substring(0, Math.Min(50, paragraph.Text.Length))}...'");
             }
         }
 
-        _logger.LogInformation($"Removed {paragraphs.Count - filtered.Count} duplicate subtitles");
+        _logger.LogInformation($"Removed {paragraphs.Count - filtered.Count} exact duplicate subtitles");
 
         // Renumber
         for (int i = 0; i < filtered.Count; i++)
@@ -606,41 +306,9 @@ public class PgsOcr
         return filtered;
     }
 
-    private static bool AreDuplicates(string text1, string text2)
-    {
-        if (string.IsNullOrWhiteSpace(text1) || string.IsNullOrWhiteSpace(text2))
-            return false;
-
-        var normalized1 = NormalizeText(text1);
-        var normalized2 = NormalizeText(text2);
-
-        // Exact match
-        if (normalized1.Equals(normalized2, StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        // Clean both and compare (catches spacing/punctuation differences)
-        var clean1 = CleanForComparison(normalized1);
-        var clean2 = CleanForComparison(normalized2);
-        
-        if (clean1.Equals(clean2, StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        // One contains the other (for partial duplicates)
-        if (normalized1.Length >= 10 && normalized2.Length >= 10)
-        {
-            var longer = normalized1.Length > normalized2.Length ? normalized1 : normalized2;
-            var shorter = normalized1.Length > normalized2.Length ? normalized2 : normalized1;
-            
-            if (longer.Contains(shorter, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-
-        return false;
-    }
-
     private static string NormalizeText(string text)
     {
-        return Regex.Replace(text.Trim(), @"\s+", " ");
+        return System.Text.RegularExpressions.Regex.Replace(text.Trim(), @"\s+", " ");
     }
 
     private static Subtitle CreateSubtitle(List<Paragraph> paragraphs)
