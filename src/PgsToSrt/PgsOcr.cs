@@ -27,8 +27,8 @@ public class PgsOcr
     public string TesseractDataPath { get; set; }
     public string TesseractLanguage { get; set; } = "eng";
     public string CharacterBlacklist { get; set; }
-    public int ShortThreshold { get; set; } = 300; // Default 300ms
-    public int ExtendTo { get; set; } = 1200; // Default 1200ms
+    public int ShortThreshold { get; set; } = 300;
+    public int ExtendTo { get; set; } = 1200;
 
     public PgsOcr(Microsoft.Extensions.Logging.ILogger logger, string tesseractVersion, string libLeptName, string libLeptVersion)
     {
@@ -48,7 +48,7 @@ public class PgsOcr
 
         _logger.LogInformation($"Starting OCR for {subtitles.Count} subtitles...");
         _logger.LogInformation($"Tesseract version: {_tesseractVersion}");
-        
+
         if (!string.IsNullOrEmpty(CharacterBlacklist))
         {
             _logger.LogInformation($"Character blacklist: '{CharacterBlacklist}'");
@@ -59,7 +59,6 @@ public class PgsOcr
             _logger.LogInformation($"Short subtitle extension: subtitles < {ShortThreshold}ms will be extended to {ExtendTo}ms");
         }
 
-        // Initialize Tesseract
         var initException = TesseractApi.Initialize(_tesseractVersion, _libLeptName, _libLeptVersion);
         if (initException != null)
         {
@@ -88,7 +87,7 @@ public class PgsOcr
         var ocrResults = new ConcurrentBag<OcrResult>();
         var processedCount = 0;
 
-        // Process subtitles in parallel using original simple approach
+        // Extract text using simple OCR approach
         Parallel.ForEach(Enumerable.Range(0, subtitles.Count), i =>
         {
             try
@@ -97,7 +96,7 @@ public class PgsOcr
                 ConfigureEngine(engine);
                 
                 var item = subtitles[i];
-                var text = GetText(engine, item);
+                var text = ExtractText(engine, item);
                 
                 if (!string.IsNullOrWhiteSpace(text))
                 {
@@ -126,13 +125,16 @@ public class PgsOcr
 
         var sortedResults = ocrResults.OrderBy(r => r.Index).ToList();
         
+        // Group overlapping subtitles to combine simultaneous dialogue
+        var groupedResults = GroupOverlappingSubtitles(sortedResults);
+        
         // Convert to paragraphs with duration extension
-        var paragraphs = ConvertToParagraphs(sortedResults);
+        var paragraphs = ConvertToParagraphs(groupedResults);
         
         return RemoveDuplicates(paragraphs);
     }
 
-    private string GetText(Engine engine, BluRaySupParserImageSharp.PcsData item)
+    private string ExtractText(Engine engine, BluRaySupParserImageSharp.PcsData item)
     {
         try
         {
@@ -142,7 +144,7 @@ public class PgsOcr
                 return string.Empty;
             }
 
-            using var image = GetPix(bitmap);
+            using var image = ConvertToPix(bitmap);
             using var page = engine.Process(image, PageSegMode.Auto);
             
             return page.Text?.Trim() ?? string.Empty;
@@ -158,23 +160,17 @@ public class PgsOcr
     {
         try
         {
-            // Set character blacklist
             if (!string.IsNullOrEmpty(CharacterBlacklist))
             {
                 engine.SetVariable("tessedit_char_blacklist", CharacterBlacklist);
             }
 
-            // Better OCR configuration for subtitles
             engine.SetVariable("tessedit_create_hocr", "0");
             engine.SetVariable("tessedit_create_pdf", "0");
             engine.SetVariable("tessedit_write_images", "0");
-            
-            // Improve text recognition
             engine.SetVariable("classify_enable_learning", "0");
             engine.SetVariable("classify_enable_adaptive_matcher", "1");
             engine.SetVariable("textord_really_old_xheight", "1");
-            
-            // Reduce word penalties for better subtitle recognition
             engine.SetVariable("language_model_penalty_non_dict_word", "0.8");
             engine.SetVariable("language_model_penalty_non_freq_dict_word", "0.9");
         }
@@ -184,7 +180,7 @@ public class PgsOcr
         }
     }
 
-    private static TesseractOCR.Pix.Image GetPix(Image<Rgba32> bitmap)
+    private static TesseractOCR.Pix.Image ConvertToPix(Image<Rgba32> bitmap)
     {
         using var stream = new MemoryStream();
         bitmap.SaveAsBmp(stream);
@@ -204,6 +200,114 @@ public class PgsOcr
         }
     }
 
+    private List<OcrResult> GroupOverlappingSubtitles(List<OcrResult> results)
+    {
+        if (results.Count <= 1) return results;
+
+        var grouped = new List<OcrResult>();
+        var processed = new HashSet<int>();
+
+        for (int i = 0; i < results.Count; i++)
+        {
+            if (processed.Contains(i)) continue;
+
+            var current = results[i];
+            var overlappingGroup = new List<OcrResult> { current };
+            processed.Add(i);
+
+            var currentStartMs = current.StartTime / 90.0;
+            var currentEndMs = current.EndTime / 90.0;
+
+            // Find all subtitles that overlap with current subtitle's time range
+            for (int j = i + 1; j < results.Count; j++)
+            {
+                if (processed.Contains(j)) continue;
+
+                var other = results[j];
+                var otherStartMs = other.StartTime / 90.0;
+                var otherEndMs = other.EndTime / 90.0;
+
+                // Check for time overlap
+                bool overlaps = (otherStartMs < currentEndMs) && (otherEndMs > currentStartMs);
+
+                if (overlaps)
+                {
+                    overlappingGroup.Add(other);
+                    processed.Add(j);
+                    
+                    // Expand time range to include this subtitle
+                    currentStartMs = Math.Min(currentStartMs, otherStartMs);
+                    currentEndMs = Math.Max(currentEndMs, otherEndMs);
+                }
+            }
+
+            // Combine overlapping subtitles
+            if (overlappingGroup.Count > 1)
+            {
+                var combinedText = CombineOverlappingTexts(overlappingGroup);
+                var earliestStart = (long)(currentStartMs * 90.0);
+                var latestEnd = (long)(currentEndMs * 90.0);
+
+                grouped.Add(new OcrResult
+                {
+                    Index = current.Index,
+                    Text = combinedText,
+                    StartTime = earliestStart,
+                    EndTime = latestEnd
+                });
+
+                _logger.LogDebug($"Combined {overlappingGroup.Count} overlapping subtitles into one");
+            }
+            else
+            {
+                grouped.Add(current);
+            }
+        }
+
+        _logger.LogInformation($"Grouped {results.Count} subtitles into {grouped.Count} (combined {results.Count - grouped.Count} overlapping)");
+        return grouped;
+    }
+
+    private string CombineOverlappingTexts(List<OcrResult> overlappingSubtitles)
+    {
+        var uniqueLines = new List<string>();
+        
+        foreach (var subtitle in overlappingSubtitles)
+        {
+            if (string.IsNullOrWhiteSpace(subtitle.Text)) continue;
+            
+            var lines = subtitle.Text.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                                   .Select(l => l.Trim())
+                                   .Where(l => !string.IsNullOrEmpty(l));
+            
+            foreach (var line in lines)
+            {
+                if (!IsLineDuplicate(line, uniqueLines))
+                {
+                    uniqueLines.Add(line);
+                }
+            }
+        }
+        
+        return string.Join("\n", uniqueLines);
+    }
+
+    private static bool IsLineDuplicate(string newLine, List<string> existingLines)
+    {
+        foreach (var existing in existingLines)
+        {
+            if (string.Equals(existing, newLine, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            var normalizedExisting = NormalizeText(existing);
+            var normalizedNew = NormalizeText(newLine);
+            
+            if (string.Equals(normalizedExisting, normalizedNew, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
     private List<Paragraph> ConvertToParagraphs(List<OcrResult> results)
     {
         var paragraphs = new List<Paragraph>();
@@ -215,10 +319,9 @@ public class PgsOcr
             var endTime = new TimeCode(result.EndTime / 90.0);
             
             var currentDuration = endTime.TotalMilliseconds - startTime.TotalMilliseconds;
-            
-            // Extend very short durations for readability
             var minDuration = CalculateMinimumDuration(result.Text);
             
+            // Extend very short durations for readability
             if (currentDuration < minDuration)
             {
                 var newEndTime = startTime.TotalMilliseconds + minDuration;
@@ -227,9 +330,9 @@ public class PgsOcr
                 if (i + 1 < results.Count)
                 {
                     var nextStartTime = new TimeCode(results[i + 1].StartTime / 90.0).TotalMilliseconds;
-                    if (newEndTime > nextStartTime - 100) // Leave 100ms gap minimum
+                    if (newEndTime > nextStartTime - 100)
                     {
-                        newEndTime = Math.Max(nextStartTime - 100, startTime.TotalMilliseconds + 500); // At least 500ms
+                        newEndTime = Math.Max(nextStartTime - 100, startTime.TotalMilliseconds + 500);
                     }
                 }
                 
@@ -255,13 +358,11 @@ public class PgsOcr
     private int CalculateMinimumDuration(string text)
     {
         if (string.IsNullOrWhiteSpace(text))
-            return 1000; // 1 second minimum
+            return 1000;
 
-        // Basic reading time: 250ms per word + 500ms base
         var wordCount = text.Split(new[] { ' ', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries).Length;
         var calculatedTime = Math.Max(wordCount * 250 + 500, 1000);
         
-        // Apply configured minimums if set
         if (ShortThreshold > 0)
             calculatedTime = Math.Max(calculatedTime, ShortThreshold);
             
@@ -283,7 +384,6 @@ public class PgsOcr
         {
             var normalizedText = NormalizeText(paragraph.Text);
             
-            // Only remove if it's an exact duplicate
             if (!seenTexts.Contains(normalizedText))
             {
                 seenTexts.Add(normalizedText);
