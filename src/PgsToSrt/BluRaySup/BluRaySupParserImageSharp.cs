@@ -14,6 +14,8 @@ public static class BluRaySupParserImageSharp
 {
     public static bool BluRaySupForceMergeAll { get; set; }
     public static bool BluRaySupSkipMerge { get; set; }
+    public static bool AllowOverlap { get; set; } = true;
+    public static int PositionThreshold { get; set; } = 50;
 
     public static List<PcsData> ParseBluRaySup(string fileName, StringBuilder log)
     {
@@ -49,8 +51,29 @@ public static class BluRaySupParserImageSharp
                         pcsData.StartTime = (long) ((matroskaSubtitle.Start - 1L) * 90.0);
                         pcsData.EndTime = (long) ((matroskaSubtitle.End - 1L) * 90.0);
                         raySupFromMatroska.Add(pcsData);
-                        if (raySupFromMatroska.Count > 1 && subtitle[raySupFromMatroska.Count - 2].End > subtitle[raySupFromMatroska.Count - 1].Start)
-                            raySupFromMatroska[raySupFromMatroska.Count - 2].EndTime = raySupFromMatroska[raySupFromMatroska.Count - 1].StartTime - 1L;
+                        // Don't adjust previous subtitle end time if they overlap
+                        // This allows multiple speakers to be shown simultaneously
+                        if (raySupFromMatroska.Count > 1 && AllowOverlap)
+                        {
+                            var prev = raySupFromMatroska[raySupFromMatroska.Count - 2];
+                            var curr = raySupFromMatroska[raySupFromMatroska.Count - 1];
+                            
+                            // Only adjust if they're not meant to overlap (same position usually means same speaker)
+                            var prevPos = prev.GetPosition();
+                            var currPos = curr.GetPosition();
+                            var positionDiff = Math.Abs(prevPos.Top - currPos.Top);
+                            
+                            if (positionDiff < PositionThreshold / 2 && subtitle[raySupFromMatroska.Count - 2].End > subtitle[raySupFromMatroska.Count - 1].Start)
+                            {
+                                prev.EndTime = curr.StartTime - 1L;
+                            }
+                        }
+                        else if (raySupFromMatroska.Count > 1)
+                        {
+                            // Traditional behavior - no overlap
+                            if (subtitle[raySupFromMatroska.Count - 2].End > subtitle[raySupFromMatroska.Count - 1].Start)
+                                raySupFromMatroska[raySupFromMatroska.Count - 2].EndTime = raySupFromMatroska[raySupFromMatroska.Count - 1].StartTime - 1L;
+                        }
                     }
 
                     ms = new MemoryStream();
@@ -426,14 +449,47 @@ public static class BluRaySupParserImageSharp
 
         if (pcs1 != null && CompletePcs(pcs1, bitmapObjects, dictionary.Count > 0 ? dictionary : lastPalettes))
             bluRaySup.Add(pcs1);
+        
+        // Improved timing adjustment for overlapping subtitles
         for (int index = 1; index < bluRaySup.Count; ++index)
         {
-            PcsData pcsData = bluRaySup[index - 1];
-            if (pcsData.EndTime == 0L)
-                pcsData.EndTime = bluRaySup[index].StartTime;
+            PcsData prev = bluRaySup[index - 1];
+            PcsData curr = bluRaySup[index];
+            
+            if (prev.EndTime == 0L)
+            {
+                if (AllowOverlap)
+                {
+                    // Check if subtitles are at different positions (different speakers)
+                    var prevPos = prev.GetPosition();
+                    var currPos = curr.GetPosition();
+                    var positionDiff = Math.Abs(prevPos.Top - currPos.Top);
+                    
+                    if (positionDiff > PositionThreshold)
+                    {
+                        // Different speakers - allow overlap
+                        // Set a reasonable end time based on text length
+                        var wordCount = prev.PcsObjects.Count * 10; // Estimate
+                        var minDuration = Math.Max(wordCount * 250 + 500, 2000);
+                        prev.EndTime = Math.Min(prev.StartTime + (minDuration * 90), curr.StartTime + (minDuration * 90));
+                    }
+                    else
+                    {
+                        // Same speaker position - don't overlap
+                        prev.EndTime = curr.StartTime;
+                    }
+                }
+                else
+                {
+                    // Traditional behavior - no overlap
+                    prev.EndTime = curr.StartTime;
+                }
+            }
         }
 
         bluRaySup.RemoveAll((Predicate<PcsData>) (pcs => pcs.PcsObjects.Count == 0));
+        
+        // Reassemble fragmented images
         foreach (PcsData pcsData in bluRaySup)
         {
             foreach (List<OdsData> bitmapObject in pcsData.BitmapObjects)
@@ -459,7 +515,8 @@ public static class BluRaySupParserImageSharp
             }
         }
 
-        if (!BluRaySupSkipMerge || BluRaySupForceMergeAll)
+        // Modified merging logic to preserve overlapping subtitles
+        if (!BluRaySupSkipMerge && !BluRaySupForceMergeAll && AllowOverlap)
         {
             var source1 = new List<DeleteIndex>();
             var deleteNo = 0;
@@ -467,7 +524,14 @@ public static class BluRaySupParserImageSharp
             {
                 var pcsData1 = bluRaySup[pcsIndex];
                 var pcsData2 = bluRaySup[pcsIndex - 1];
-                if (Math.Abs(pcsData2.EndTime - pcsData1.StartTime) < 10L)
+                
+                // Check if they're at different positions (different speakers)
+                var pos1 = pcsData1.GetPosition();
+                var pos2 = pcsData2.GetPosition();
+                var positionDiff = Math.Abs(pos1.Top - pos2.Top);
+                
+                // Only merge if they're at the same position and very close in time
+                if (positionDiff < PositionThreshold / 2 && Math.Abs(pcsData2.EndTime - pcsData1.StartTime) < 10L)
                 {
                     var size = pcsData2.Size;
                     var width1 = size.Width;
@@ -481,7 +545,9 @@ public static class BluRaySupParserImageSharp
                         int height2 = size.Height;
                         if (height1 == height2)
                         {
-                            if (pcsData1.BitmapObjects.Count > 0 && pcsData1.BitmapObjects[0].Count > 0 && pcsData2.BitmapObjects.Count == pcsData1.BitmapObjects.Count && pcsData2.BitmapObjects[0].Count == pcsData1.BitmapObjects[0].Count)
+                            if (pcsData1.BitmapObjects.Count > 0 && pcsData1.BitmapObjects[0].Count > 0 && 
+                                pcsData2.BitmapObjects.Count == pcsData1.BitmapObjects.Count && 
+                                pcsData2.BitmapObjects[0].Count == pcsData1.BitmapObjects[0].Count)
                             {
                                 var flag = true;
                                 for (var index1 = 0; index1 < pcsData1.BitmapObjects.Count; ++index1)
@@ -521,21 +587,16 @@ public static class BluRaySupParserImageSharp
                                             Number = deleteNo,
                                             Index = pcsIndex
                                         });
-                                        //continue;
                                     }
-
                                     continue;
                                 }
-
                                 deleteNo++;
-                                //continue;
+                                continue;
                             }
-
                             continue;
                         }
                     }
                 }
-
                 deleteNo++;
             }
 
@@ -579,6 +640,16 @@ public static class BluRaySupParserImageSharp
             return true;
         var pcs1 = pcsList[arr[0].Index];
         var pcs2 = pcsList[arr[1].Index];
+        
+        // Check if they're at different positions (different speakers)
+        var pos1 = pcs1.GetPosition();
+        var pos2 = pcs2.GetPosition();
+        var positionDiff = Math.Abs(pos1.Top - pos2.Top);
+        
+        // Don't merge if they're at significantly different positions
+        if (positionDiff > PositionThreshold)
+            return false;
+        
         var num1 = pcs1.EndTimeCode.TotalMilliseconds - pcs1.StartTimeCode.TotalMilliseconds;
         var num2 = pcs2.EndTimeCode.TotalMilliseconds - pcs2.StartTimeCode.TotalMilliseconds;
         if (num1 < 400.0 || num2 < 400.0 || pcs1.PaletteInfos.Count > 2 || pcs2.PaletteInfos.Count > 2)

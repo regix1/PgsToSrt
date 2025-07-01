@@ -1,6 +1,7 @@
 using CommandLine;
 using Microsoft.Extensions.Logging;
 using PgsToSrt.Options;
+using PgsToSrt.BluRaySup;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -24,6 +25,8 @@ namespace PgsToSrt
         private string _characterBlacklist;
         private int _shortThreshold;
         private int _extendTo;
+        private bool _allowOverlap;
+        private int _positionThreshold;
 
         public Runner(ILogger<Runner> logger)
         {
@@ -58,6 +61,8 @@ namespace PgsToSrt
             _characterBlacklist = values.Value.CharacterBlacklist;
             _shortThreshold = values.Value.ShortThreshold;
             _extendTo = values.Value.ExtendTo;
+            _allowOverlap = values.Value.AllowOverlap;
+            _positionThreshold = values.Value.PositionThreshold;
 
             // Windows uses tesseract50.dll installed by nuget package, so always use v5
             // Other systems can uses different libtesseract versions, keep v4 as default.
@@ -137,6 +142,10 @@ namespace PgsToSrt
 
         private bool ConvertPgs(string input, int? track, string output)
         {
+            // Set global parser options
+            BluRaySupParserImageSharp.AllowOverlap = _allowOverlap;
+            BluRaySupParserImageSharp.PositionThreshold = _positionThreshold;
+
             var pgsParser = new PgsParser(_logger);
             var subtitles = pgsParser.Load(input, track.GetValueOrDefault());
 
@@ -149,12 +158,21 @@ namespace PgsToSrt
                 TesseractLanguage = _tesseractLanguage,
                 CharacterBlacklist = _characterBlacklist,
                 ShortThreshold = _shortThreshold,
-                ExtendTo = _extendTo
+                ExtendTo = _extendTo,
+                AllowOverlap = _allowOverlap,
+                PositionThreshold = _positionThreshold
             };
 
             pgsOcr.ToSrt(subtitles, output);
 
             return true;
+        }
+        
+        private class TrackOption
+        {
+            public string Input { get; set; }
+            public string Output { get; set; }
+            public int? Track { get; set; }
         }
     }
 }
