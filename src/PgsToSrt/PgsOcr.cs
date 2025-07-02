@@ -29,7 +29,7 @@ public class PgsOcr
     public string CharacterBlacklist { get; set; }
     public int ShortThreshold { get; set; } = 300;
     public int ExtendTo { get; set; } = 1200;
-    public bool AllowOverlap { get; set; } = true;
+    public bool AllowOverlap { get; set; } = false; // Default to false for compatibility
     public int PositionThreshold { get; set; } = 50;
 
     public PgsOcr(Microsoft.Extensions.Logging.ILogger logger, string tesseractVersion, string libLeptName, string libLeptVersion)
@@ -59,6 +59,11 @@ public class PgsOcr
         if (ShortThreshold > 0 && ExtendTo > 0)
         {
             _logger.LogInformation($"Short subtitle extension: subtitles < {ShortThreshold}ms will be extended to {ExtendTo}ms");
+        }
+
+        if (AllowOverlap)
+        {
+            _logger.LogInformation($"Overlap handling enabled with position threshold: {PositionThreshold} pixels");
         }
 
         var initException = TesseractApi.Initialize(_tesseractVersion, _libLeptName, _libLeptVersion);
@@ -134,13 +139,53 @@ public class PgsOcr
         // Sort by index
         var sortedResults = ocrResults.OrderBy(r => r.Index).ToList();
         
-        // Process overlapping subtitles intelligently if allowed
-        var processedResults = AllowOverlap 
+        // Detect if we have potential narrator issues
+        var hasNarratorIssues = DetectNarratorOverlap(sortedResults);
+        
+        // Only apply overlap processing if enabled AND we detected issues
+        var processedResults = (AllowOverlap && hasNarratorIssues) 
             ? ProcessOverlappingSubtitles(sortedResults)
             : MergeConsecutiveDuplicates(sortedResults);
         
         // Convert to paragraphs
         return ConvertToParagraphs(processedResults);
+    }
+
+    private bool DetectNarratorOverlap(List<OcrResult> results)
+    {
+        // Look for patterns that indicate narrator overlap issues:
+        // 1. Very long subtitles (> 10 seconds) that overlap with multiple shorter ones
+        // 2. Subtitles that span across 3+ other subtitles
+        
+        for (int i = 0; i < results.Count; i++)
+        {
+            var current = results[i];
+            var duration = (current.EndTime - current.StartTime) / 90.0; // Convert to milliseconds
+            
+            // Check if this is a potential narrator subtitle (long duration)
+            if (duration > 10000) // 10 seconds
+            {
+                // Count how many subtitles overlap with this one
+                var overlapCount = 0;
+                for (int j = i + 1; j < results.Count && j < i + 10; j++)
+                {
+                    var next = results[j];
+                    if (SubtitlesOverlap(current.StartTime, current.EndTime, next.StartTime, next.EndTime))
+                    {
+                        overlapCount++;
+                    }
+                }
+                
+                // If this subtitle overlaps with 3+ others, we likely have a narrator issue
+                if (overlapCount >= 3)
+                {
+                    _logger.LogInformation($"Detected potential narrator overlap at subtitle {i} (duration: {duration}ms, overlaps: {overlapCount})");
+                    return true;
+                }
+            }
+        }
+        
+        return false;
     }
 
     private List<OcrResult> ProcessOverlappingSubtitles(List<OcrResult> results)
@@ -199,117 +244,34 @@ public class PgsOcr
         if (group.Count == 1)
             return group;
         
-        // Group by Y position to identify different speakers
-        var positionGroups = group
-            .GroupBy(r => GetSpeakerGroup(r.YPosition))
-            .OrderBy(g => g.Key)
-            .ToList();
-        
+        // Identify potential narrator subtitles (long duration, specific Y positions)
         var results = new List<OcrResult>();
         
-        foreach (var posGroup in positionGroups)
+        foreach (var sub in group)
         {
-            var speakerSubs = posGroup.OrderBy(r => r.StartTime).ToList();
+            var duration = (sub.EndTime - sub.StartTime) / 90.0;
             
-            // Try to merge consecutive identical/similar text from same speaker
-            var merged = MergeSameSpeakerSubtitles(speakerSubs);
-            results.AddRange(merged);
-        }
-        
-        // Ensure proper timing for overlapping speakers
-        results = AdjustOverlappingTiming(results);
-        
-        return results.OrderBy(r => r.StartTime).ThenBy(r => r.YPosition).ToList();
-    }
-
-    private int GetSpeakerGroup(int yPosition)
-    {
-        // Group Y positions into regions (top, middle, bottom)
-        // This helps identify different speakers
-        if (yPosition < 150)
-            return 0; // Top speaker
-        else if (yPosition < 350)
-            return 1; // Middle speaker
-        else
-            return 2; // Bottom speaker
-    }
-
-    private List<OcrResult> MergeSameSpeakerSubtitles(List<OcrResult> speakerSubs)
-    {
-        if (speakerSubs.Count <= 1)
-            return speakerSubs;
-        
-        var merged = new List<OcrResult>();
-        var i = 0;
-        
-        while (i < speakerSubs.Count)
-        {
-            var current = speakerSubs[i];
-            var currentLines = SplitIntoLines(current.Text);
-            var startTime = current.StartTime;
-            var endTime = current.EndTime;
-            
-            // Look ahead for continuations of the same dialogue
-            var j = i + 1;
-            while (j < speakerSubs.Count)
+            // If this is a very long subtitle that overlaps with many others, 
+            // it's likely a narrator - adjust its timing
+            if (duration > 10000 && group.Count > 3)
             {
-                var next = speakerSubs[j];
+                // Find the next non-overlapping subtitle
+                var nextNonOverlapping = group
+                    .Where(s => s != sub && s.StartTime > sub.StartTime)
+                    .OrderBy(s => s.StartTime)
+                    .FirstOrDefault(s => !SubtitlesOverlap(sub.StartTime, sub.EndTime, s.StartTime, s.EndTime));
                 
-                // Check if this is a continuation (small gap and similar position)
-                var timeDiff = next.StartTime - endTime;
-                var positionDiff = Math.Abs(next.YPosition - current.YPosition);
-                
-                if (timeDiff < 90 * 100 && positionDiff < PositionThreshold / 2) // Less than 100ms gap, similar position
+                if (nextNonOverlapping != null)
                 {
-                    var nextLines = SplitIntoLines(next.Text);
-                    
-                    // Check if any lines are repeated (continuation of same dialogue)
-                    var hasCommonLine = currentLines.Any(line => 
-                        nextLines.Contains(line, StringComparer.OrdinalIgnoreCase));
-                    
-                    if (hasCommonLine || nextLines.All(line => 
-                        !currentLines.Contains(line, StringComparer.OrdinalIgnoreCase)))
-                    {
-                        // Merge the subtitles
-                        endTime = Math.Max(endTime, next.EndTime);
-                        
-                        // Add new lines that aren't already present
-                        foreach (var line in nextLines)
-                        {
-                            if (!currentLines.Contains(line, StringComparer.OrdinalIgnoreCase))
-                            {
-                                currentLines.Add(line);
-                            }
-                        }
-                        
-                        j++;
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
-                else
-                {
-                    break;
+                    // Trim the narrator subtitle to end just before the next dialogue
+                    sub.EndTime = nextNonOverlapping.StartTime - 90; // 1ms gap
                 }
             }
             
-            // Create merged result
-            merged.Add(new OcrResult
-            {
-                Index = current.Index,
-                Text = string.Join("\n", currentLines.Take(3)), // Max 3 lines
-                StartTime = startTime,
-                EndTime = endTime,
-                YPosition = current.YPosition,
-                IsForced = current.IsForced
-            });
-            
-            i = j;
+            results.Add(sub);
         }
         
-        return merged;
+        return results.OrderBy(r => r.StartTime).ThenBy(r => r.YPosition).ToList();
     }
 
     private List<OcrResult> MergeConsecutiveDuplicates(List<OcrResult> results)
@@ -395,49 +357,6 @@ public class PgsOcr
         return merged;
     }
 
-    private List<OcrResult> AdjustOverlappingTiming(List<OcrResult> results)
-    {
-        // Don't cut off subtitles when they overlap
-        // Instead, let them display simultaneously
-        for (int i = 0; i < results.Count; i++)
-        {
-            var current = results[i];
-            
-            // Find all subtitles that overlap with this one
-            var overlapping = results
-                .Where((r, idx) => idx != i && 
-                       SubtitlesOverlap(current.StartTime, current.EndTime, r.StartTime, r.EndTime))
-                .ToList();
-            
-            if (overlapping.Any())
-            {
-                // Ensure minimum display time for readability
-                var minDuration = CalculateMinimumDuration(current.Text);
-                var currentDuration = current.EndTime - current.StartTime;
-                
-                if (currentDuration < minDuration * 90) // Convert to PTS units
-                {
-                    current.EndTime = current.StartTime + (minDuration * 90);
-                }
-            }
-        }
-        
-        return results;
-    }
-
-    private bool SubtitlesOverlap(long start1, long end1, long start2, long end2)
-    {
-        return start1 < end2 && start2 < end1;
-    }
-
-    private List<string> SplitIntoLines(string text)
-    {
-        return text.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
-                   .Select(l => l.Trim())
-                   .Where(l => !string.IsNullOrEmpty(l))
-                   .ToList();
-    }
-
     private List<Paragraph> ConvertToParagraphs(List<OcrResult> results)
     {
         var paragraphs = new List<Paragraph>();
@@ -451,36 +370,26 @@ public class PgsOcr
             var currentDuration = endTime.TotalMilliseconds - startTime.TotalMilliseconds;
             var minDuration = CalculateMinimumDuration(result.Text);
             
-            // Extend very short durations for readability
-            if (currentDuration < minDuration)
+            // Only extend truly short subtitles
+            if (currentDuration < ShortThreshold && ShortThreshold > 0 && ExtendTo > 0)
             {
-                var newEndTime = startTime.TotalMilliseconds + minDuration;
+                var newEndTime = startTime.TotalMilliseconds + ExtendTo;
                 
-                if (AllowOverlap)
+                // Check if extending would overlap with next subtitle
+                if (i + 1 < results.Count)
                 {
-                    // For overlapping subtitles, don't worry about extending into next subtitle
-                    // This allows multiple speakers to be shown simultaneously
+                    var nextStartTime = new TimeCode(results[i + 1].StartTime / 90.0).TotalMilliseconds;
+                    if (newEndTime > nextStartTime - 100)
+                    {
+                        newEndTime = Math.Max(nextStartTime - 100, startTime.TotalMilliseconds + 500);
+                    }
+                }
+                
+                if (newEndTime > startTime.TotalMilliseconds)
+                {
                     endTime = new TimeCode(newEndTime);
+                    _logger.LogDebug($"Extended subtitle {i + 1} from {currentDuration}ms to {endTime.TotalMilliseconds - startTime.TotalMilliseconds}ms for readability");
                 }
-                else
-                {
-                    // Check if extending would overlap with next subtitle
-                    if (i + 1 < results.Count)
-                    {
-                        var nextStartTime = new TimeCode(results[i + 1].StartTime / 90.0).TotalMilliseconds;
-                        if (newEndTime > nextStartTime - 100)
-                        {
-                            newEndTime = Math.Max(nextStartTime - 100, startTime.TotalMilliseconds + 500);
-                        }
-                    }
-                    
-                    if (newEndTime > startTime.TotalMilliseconds)
-                    {
-                        endTime = new TimeCode(newEndTime);
-                    }
-                }
-                
-                _logger.LogDebug($"Extended subtitle {i + 1} from {currentDuration}ms to {endTime.TotalMilliseconds - startTime.TotalMilliseconds}ms for readability");
             }
             
             paragraphs.Add(new Paragraph
@@ -501,15 +410,13 @@ public class PgsOcr
             return 1000;
 
         var wordCount = text.Split(new[] { ' ', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries).Length;
-        var calculatedTime = Math.Max(wordCount * 250 + 500, 1000);
-        
-        if (ShortThreshold > 0)
-            calculatedTime = Math.Max(calculatedTime, ShortThreshold);
-            
-        if (ExtendTo > 0)
-            calculatedTime = Math.Max(calculatedTime, ExtendTo);
-            
-        return calculatedTime;
+        // Standard reading speed: ~250ms per word + 500ms base
+        return Math.Max(wordCount * 250 + 500, 1000);
+    }
+
+    private bool SubtitlesOverlap(long start1, long end1, long start2, long end2)
+    {
+        return start1 < end2 && start2 < end1;
     }
 
     private string ExtractText(Engine engine, BluRaySupParserImageSharp.PcsData item)
