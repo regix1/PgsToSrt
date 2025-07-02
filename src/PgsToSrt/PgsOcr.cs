@@ -360,38 +360,58 @@ public class PgsOcr
     private List<Paragraph> ConvertToParagraphs(List<OcrResult> results)
     {
         var paragraphs = new List<Paragraph>();
-        
+
         for (int i = 0; i < results.Count; i++)
         {
             var result = results[i];
             var startTime = new TimeCode(result.StartTime / 90.0);
             var endTime = new TimeCode(result.EndTime / 90.0);
-            
+
             var currentDuration = endTime.TotalMilliseconds - startTime.TotalMilliseconds;
             var minDuration = CalculateMinimumDuration(result.Text);
-            
+
             // Only extend truly short subtitles
             if (currentDuration < ShortThreshold && ShortThreshold > 0 && ExtendTo > 0)
             {
                 var newEndTime = startTime.TotalMilliseconds + ExtendTo;
-                
-                // Check if extending would overlap with next subtitle
+
                 if (i + 1 < results.Count)
                 {
-                    var nextStartTime = new TimeCode(results[i + 1].StartTime / 90.0).TotalMilliseconds;
-                    if (newEndTime > nextStartTime - 100)
+                    var next = results[i + 1];
+                    var nextStartTime = new TimeCode(next.StartTime / 90.0).TotalMilliseconds;
+
+                    // Only clamp extension if overlapping with same Y position
+                    if (Math.Abs(result.YPosition - next.YPosition) < PositionThreshold)
                     {
-                        newEndTime = Math.Max(nextStartTime - 100, startTime.TotalMilliseconds + 500);
+                        if (newEndTime > nextStartTime - 100)
+                        {
+                            newEndTime = Math.Max(nextStartTime - 100, startTime.TotalMilliseconds + 500);
+                        }
                     }
                 }
-                
+
                 if (newEndTime > startTime.TotalMilliseconds)
                 {
                     endTime = new TimeCode(newEndTime);
                     _logger.LogDebug($"Extended subtitle {i + 1} from {currentDuration}ms to {endTime.TotalMilliseconds - startTime.TotalMilliseconds}ms for readability");
                 }
             }
-            
+
+            // Ensure subtitle does not overlap another in same Y position
+            if (i + 1 < results.Count)
+            {
+                var next = results[i + 1];
+                if (Math.Abs(result.YPosition - next.YPosition) < PositionThreshold && SubtitlesOverlap(result.StartTime, result.EndTime, next.StartTime, next.EndTime))
+                {
+                    var adjustedEnd = next.StartTime - 90;
+                    if (adjustedEnd > result.StartTime)
+                    {
+                        endTime = new TimeCode(adjustedEnd / 90.0);
+                        _logger.LogDebug($"Clamped subtitle {i + 1} to avoid stacking");
+                    }
+                }
+            }
+
             paragraphs.Add(new Paragraph
             {
                 Number = i + 1,
@@ -400,7 +420,7 @@ public class PgsOcr
                 Text = result.Text
             });
         }
-        
+
         return paragraphs;
     }
 
